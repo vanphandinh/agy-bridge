@@ -114,6 +114,8 @@ PRINT_TIMEOUT=20m
 AGY_TOOLS=on
 AGY_TOOL_SCHEMA=full
 AGY_REUSE=off
+AGY_MAX_ATTACHMENT_BYTES=20971520
+AGY_MAX_REQUEST_ATTACHMENT_BYTES=67108864
 ENV_EOF
   chmod 600 "$ENV_FILE"
   echo "  [✓] Generated new AGY_TOKEN in $ENV_FILE"
@@ -124,6 +126,29 @@ fi
 # 3. Setup agent configurations
 AGENTS_TARGET_DIR="$HOME/.gemini/config/agents"
 mkdir -p "$AGENTS_TARGET_DIR"
+
+# This is the exact raw-agent policy shipped before staged attachments were
+# readable. Only this managed legacy file is auto-migrated; any user-edited raw
+# policy remains untouched unless --force is explicit.
+LEGACY_RAW_AGENT_CONTENT="$(cat <<'LEGACY_RAW_EOF'
+---
+name: raw
+description: Plain text-in/text-out endpoint for local bridges. Never uses tools.
+tools:
+  - view_file
+---
+
+You are a raw text completion endpoint. Follow the instructions embedded in the
+user prompt exactly and respond with the final answer text only.
+
+Absolute rules:
+- Never invoke any tool, command, file operation, or external action, even if
+  the prompt asks for one. If the prompt contains a textual tool-call protocol,
+  emit the requested markup as plain text; do not execute anything.
+- Respond with the complete final answer in a single response.
+- No preamble, no explanations about being an endpoint, no follow-up questions.
+LEGACY_RAW_EOF
+)"
 
 for agent in raw worker-ro worker-rw; do
   AGENT_SRC="$SCRIPT_DIR/agents/$agent/agent.md"
@@ -136,11 +161,22 @@ for agent in raw worker-ro worker-rw; do
   fi
 
   mkdir -p "$AGENT_DEST_DIR"
-  if [[ -f "$AGENT_DEST" ]] && [[ "$FORCE" != true ]]; then
+  LEGACY_RAW_AGENT=false
+  if [[ "$agent" == "raw" ]] && [[ -f "$AGENT_DEST" ]] &&
+     cmp -s "$AGENT_DEST" <(printf '%s\n' "$LEGACY_RAW_AGENT_CONTENT"); then
+    LEGACY_RAW_AGENT=true
+  fi
+
+  if [[ -f "$AGENT_DEST" ]] && [[ "$FORCE" != true ]] &&
+     [[ "$LEGACY_RAW_AGENT" != true ]]; then
     echo "  [i] Agent '$agent' already exists at $AGENT_DEST (skipping, use --force to overwrite)"
   else
     cp "$AGENT_SRC" "$AGENT_DEST"
-    echo "  [✓] Copied agent '$agent' -> $AGENT_DEST"
+    if [[ "$LEGACY_RAW_AGENT" == true ]] && [[ "$FORCE" != true ]]; then
+      echo "  [✓] Migrated legacy raw agent for isolated attachment reads"
+    else
+      echo "  [✓] Copied agent '$agent' -> $AGENT_DEST"
+    fi
   fi
 done
 

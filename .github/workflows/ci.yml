@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  deno:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.5
+      - name: Format feature files
+        run: |
+          # The upstream baseline is not repo-wide deno-fmt clean. Keep this
+          # feature gate scoped so multimodal work does not rewrite unrelated files.
+          deno fmt --check \
+            message-content.ts request-workspace.ts \
+            message-content.test.ts request-workspace.test.ts \
+            tests/abort-concurrency.test.ts tests/deadline-concurrency.test.ts \
+            tests/config.test.ts tests/installer-agents.test.ts \
+            tests/multimodal-service.test.ts \
+            docs/third-party-notices.md
+      - name: Lint
+        run: deno lint
+      - name: Test
+        run: deno task test
+      - name: Policy guard
+        run: |
+          if grep -nE 'cloudcode-pa\.googleapis\.com|daily-cloudcode-pa\.googleapis\.com|dangerously-skip-permissions' \
+            agy-bridge.ts message-content.ts request-workspace.ts; then
+            echo 'forbidden runtime pattern found'
+            exit 1
+          fi

@@ -7,7 +7,7 @@
 localmente:
 
 - **Entorno:** detecta rutas de `deno`/`agy`, inicializa `~/.config/agy-bridge/env` (desde [`.env.example`](../.env.example)).
-- **Agentes:** copia perfiles `raw`, `worker-ro`, `worker-rw` a `~/.gemini/config/agents/`.
+- **Agentes:** copia perfiles `raw`, `worker-ro`, `worker-rw` a `~/.gemini/config/agents/`. En upgrades, migra automáticamente solo el `raw/agent.md` canónico legado que todavía prohibía todo uso de tools; cualquier `raw` personalizado se preserva salvo `--force`.
 - **Provider + plugin + modelos:** registra provider `agy-bridge` (`baseURL: "http://127.0.0.1:7421/v1"`), instala `~/.config/opencode/plugins/agy-bridge.ts` y sincroniza en vivo los modelos `auto-ro/rw-*` con `variants` dinámicos delegando en `scripts/sync-models.ts` (resolución en 3 niveles: `agy models` TSV → `GET /v1/models` → fallback agrupado).
 
 ```sh
@@ -66,6 +66,11 @@ Si no utilizas systemd o prefieres configurar todo a mano, replica lo que hace `
    # con --force: sobrescribe existentes
    ```
 
+   Si estás actualizando una instalación anterior y personalizaste
+   `raw/agent.md`, aplicá manualmente la excepción de `view_file` documentada en
+   `agents/raw/agent.md`; el instalador no pisa configuraciones personalizadas
+   sin `--force`.
+
 3. **Instalar plugin de opencode (bundle autocontenido):**
    El plugin `plugins/agy-bridge.ts` se empaqueta como bundle autocontenido con `deno task bundle:plugin` (generado desde `plugins/agy-bridge.plugin.ts` inlinendo `plugins/agy-bridge-helpers.ts`):
 
@@ -98,9 +103,16 @@ Si no utilizas systemd o prefieres configurar todo a mano, replica lo que hace `
 
      ```sh
      set -a; source ~/.config/agy-bridge/env; set +a
-     $DENO_BIN run --allow-net --allow-run=$AGY_BIN \
-       --allow-write=$HOME/.local/state/agy-bridge --allow-env agy-bridge.ts
+     $DENO_BIN run --allow-net=127.0.0.1 --allow-run=$AGY_BIN \
+       --allow-read=$HOME/.gemini/antigravity-cli/brain,$HOME/.local/state/agy-bridge \
+       --allow-write=$HOME/.local/state/agy-bridge --allow-env \
+       --unstable-no-legacy-abort agy-bridge.ts
      ```
+
+   La lectura de `~/.local/state/agy-bridge` es necesaria porque los requests
+   bare usan `$STATE_DIR/work/req-*` como `cwd` del hijo; la lectura de
+   `~/.gemini/antigravity-cli/brain` mantiene el mecanismo existente de salvage
+   de transcript. No hace falta conceder lectura a todo `$HOME`.
 
 ## Provider OpenCode (global)
 
@@ -148,7 +160,7 @@ Cualquier nuevo modelo o esfuerzo de razonamiento expuesto por Antigravity (como
 
 ## Parche del TUI gentle-ai (effort)
 
-**Por qué existe:** el provider `agy-bridge` publica cada modelo en forma plana — `reasoning: true` a nivel del modelo + `variants.*.reasoningEffort`, sin objeto `capabilities` (verificado con `cat ~/.config/opencode/opencode.json | jq` y `deno test` 80/80). Sin embargo, el SDK `@ai-sdk/openai-compatible` que usa `opencode` enriquece el modelo y deja `capabilities.reasoning` en `false` (o ausente) en `api.state.provider` (el que ve el TUI). Resultado: `/sdd-model` → effort mostraba `Model ... does not expose reasoning effort options` aunque el provider nativo y `/variant` andaban bien.
+**Por qué existe:** el provider `agy-bridge` publica cada modelo en forma plana — `reasoning: true` a nivel del modelo + `variants.*.reasoningEffort`, sin objeto `capabilities` (verificado con `cat ~/.config/opencode/opencode.json | jq` y la suite `deno task test`). Sin embargo, el SDK `@ai-sdk/openai-compatible` que usa `opencode` enriquece el modelo y deja `capabilities.reasoning` en `false` (o ausente) en `api.state.provider` (el que ve el TUI). Resultado: `/sdd-model` → effort mostraba `Model ... does not expose reasoning effort options` aunque el provider nativo y `/variant` andaban bien.
 
 **Qué hace el instalador (100% transparente):** `install.sh` sección **#7** parchea idempotentemente, si existe, el TUI cacheado de gentle-ai:
 
@@ -208,6 +220,11 @@ curl -s http://127.0.0.1:7421/v1/chat/completions -H "content-type: application/
 # Stream: añadir "stream":true y usar curl -N
 ```
 
+Para el path bare/multimodal, elegí un id bare realmente devuelto por
+`GET /v1/models` y hacé además un smoke con el CLI oficial, por ejemplo con un
+`data:text/plain;base64,...` pequeño. La suite automatizada usa un mock `agy` y
+no reemplaza esa comprobación de integración de `view_file`.
+
 ## Rollback
 
 ```sh
@@ -217,4 +234,6 @@ curl -s http://127.0.0.1:7421/v1/chat/completions -H "content-type: application/
 # Reiniciar TUI y verificar: opencode models | grep -q agy-bridge && echo "still there" || echo "clean"
 ```
 
-No hay cambios en `agy-bridge.ts` ni en systemd; `baseURL` loopback y `accessGuard` (Host 403, Bearer 401) permanecen.
+Los cambios de aislamiento afectan el `cwd` de requests bare y los permisos
+Deno mínimos necesarios para ese path; `baseURL` loopback, `accessGuard` (Host
+403, Bearer 401) y la semántica de `auto-*` permanecen intactos.
