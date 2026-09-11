@@ -18,6 +18,16 @@ import {
   resolveWireModel,
   variantSignals,
 } from "./plugins/agy-bridge-helpers.ts";
+import {
+  type MessageContent,
+  normalizeMessageContent,
+} from "./message-content.ts";
+import {
+  type AttachmentLimits,
+  AttachmentInputError,
+  createRequestWorkspace,
+  type RequestWorkspace,
+} from "./request-workspace.ts";
 
 // ---------- config ----------
 
@@ -54,6 +64,28 @@ const AGY_TOKEN = Deno.env.get("AGY_TOKEN") ?? "";
 const STATE_DIR = Deno.env.get("STATE_DIR") ??
   `${Deno.env.get("HOME")}/.local/state/agy-bridge`;
 const USAGE_LOG = `${STATE_DIR}/usage.jsonl`;
+
+function positiveByteLimit(name: string, fallback: number): number {
+  const raw = Deno.env.get(name);
+  const value = raw === undefined ? fallback : Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a positive finite number`);
+  }
+  return value;
+}
+
+const MAX_ATTACHMENT_BYTES = positiveByteLimit(
+  "AGY_MAX_ATTACHMENT_BYTES",
+  20 * 1024 * 1024,
+);
+const MAX_REQUEST_ATTACHMENT_BYTES = positiveByteLimit(
+  "AGY_MAX_REQUEST_ATTACHMENT_BYTES",
+  64 * 1024 * 1024,
+);
+const ATTACHMENT_LIMITS: AttachmentLimits = {
+  maxAttachmentBytes: MAX_ATTACHMENT_BYTES,
+  maxRequestAttachmentBytes: MAX_REQUEST_ATTACHMENT_BYTES,
+};
 
 // ---------- autonomous delegation (models prefixed "auto-<profile>-") ----------
 //
@@ -162,16 +194,7 @@ async function appendUsage(entry: Record<string, unknown>) {
 let active = 0;
 const waiters: Array<() => void> = [];
 
-async function acquire(): Promise<() => void> {
-  if (active >= MAX_CONCURRENT) {
-    await new Promise<void>((resolve) => waiters.push(resolve));
-    // release() handed us slot ownership synchronously, BEFORE this
-    // continuation ran: active already counts us. Incrementing here would
-    // open a barge-in window where a fresh arrival sees a decremented
-    // counter and double-subscribes past MAX_CONCURRENT.
-  } else {
-    active++;
-  }
+function makeRelease(): () => void {
   let released = false;
   return () => {
     if (released) return;
@@ -180,6 +203,44 @@ async function acquire(): Promise<() => void> {
     if (next) next(); // transfer the slot directly; active stays as-is
     else active--;
   };
+}
+
+async function acquire(signal?: AbortSignal): Promise<(() => void) | null> {
+  if (signal?.aborted) return null;
+  if (active < MAX_CONCURRENT) {
+    active++;
+    return makeRelease();
+  }
+
+  return await new Promise<(() => void) | null>((resolve) => {
+    let settled = false;
+    // deno-lint-ignore prefer-const -- forward reference shared with onAbort
+    let grant: () => void;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      const index = waiters.indexOf(grant);
+      if (index >= 0) waiters.splice(index, 1);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(null);
+    };
+    grant = () => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      if (signal?.aborted) {
+        const next = waiters.shift();
+        if (next) next();
+        else active--;
+        resolve(null);
+        return;
+      }
+      resolve(makeRelease());
+    };
+    waiters.push(grant);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
 }
 
 // ---------- models ----------
@@ -222,7 +283,7 @@ interface OAIChatRequest {
 
 interface AIMessage {
   role: "system" | "user" | "assistant" | "tool" | (string & Record<PropertyKey, never>);
-  content?: string | Array<{ type?: string; text?: string }> | null;
+  content?: MessageContent;
   tool_calls?: Array<{
     id?: string;
     function?: { name?: string; arguments?: string };
@@ -239,6 +300,59 @@ function textContent(m: AIMessage): string {
       .join("");
   }
   return "";
+}
+
+function autoContentIsTextOnly(body: OAIChatRequest): boolean {
+  for (const message of body.messages ?? []) {
+    const content: unknown = message.content;
+    if (content == null || typeof content === "string") continue;
+    if (!Array.isArray(content)) return false;
+    for (const part of content) {
+      if (
+        typeof part !== "object" || part === null ||
+        (part as { type?: unknown }).type !== "text" ||
+        typeof (part as { text?: unknown }).text !== "string"
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+async function normalizeBareRequest(
+  body: OAIChatRequest,
+  workspace: RequestWorkspace,
+): Promise<OAIChatRequest> {
+  const messages: AIMessage[] = [];
+  let totalAttachmentBytes = 0;
+
+  for (const message of body.messages ?? []) {
+    const remaining = Math.max(
+      0,
+      ATTACHMENT_LIMITS.maxRequestAttachmentBytes - totalAttachmentBytes,
+    );
+    const normalized = await normalizeMessageContent(
+      message.content,
+      workspace,
+      {
+        maxAttachmentBytes: ATTACHMENT_LIMITS.maxAttachmentBytes,
+        maxRequestAttachmentBytes: remaining,
+      },
+    );
+    totalAttachmentBytes += normalized.totalAttachmentBytes;
+    messages.push({ ...message, content: normalized.text });
+  }
+
+  return { ...body, messages };
+}
+
+async function cleanupWorkspace(workspace: RequestWorkspace): Promise<void> {
+  try {
+    await workspace.cleanup();
+  } catch (error) {
+    console.error("request workspace cleanup failed:", error);
+  }
 }
 
 // ---------- prompt rendering ----------
@@ -616,8 +730,13 @@ async function runAgy(
   signal?: AbortSignal,
   conversationId?: string,
   agent: string = AGY_AGENT,
+  cwd?: string,
 ): Promise<AgyResult> {
-  const release = await acquire();
+  const release = await acquire(signal);
+  if (!release || signal?.aborted) {
+    release?.();
+    return { ok: false, text: "", error: "request aborted" };
+  }
   const started = Date.now();
   const args = [
     "--agent", agent,
@@ -627,31 +746,40 @@ async function runAgy(
     "--print-timeout", PRINT_TIMEOUT,
   ];
   if (conversationId) args.push("--conversation", conversationId);
-  const child = new Deno.Command(AGY_BIN, {
-    args,
-    stdout: "piped",
-    stderr: "piped",
-    stdin: "piped",
-    env: childEnv(),
-    clearEnv: true,
-  }).spawn();
 
-  // Prompts can exceed the 128 KiB per-argv Linux limit (opencode orchestrator
-  // system prompts do), so the prompt travels on stdin as a single NDJSON user
-  // event — agy's documented stream-json input protocol.
-  const stdinWriter = child.stdin.getWriter();
+  let child: Deno.ChildProcess;
   try {
-    await stdinWriter.write(
-      enc.encode(JSON.stringify({ event: "user", message: { content: prompt } }) + "\n"),
-    );
-  } finally {
-    stdinWriter.releaseLock();
+    child = new Deno.Command(AGY_BIN, {
+      args,
+      cwd,
+      stdout: "piped",
+      stderr: "piped",
+      stdin: "piped",
+      env: childEnv(),
+      clearEnv: true,
+    }).spawn();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const result: AgyResult = {
+      ok: false,
+      text: "",
+      error: `agy spawn failed: ${message || "unknown error"}`,
+    };
+    if (conversationId) handlers.evict?.();
+    release();
+    const dur = (Date.now() - started) / 1000;
+    await appendUsage({
+      model,
+      duration_s: Number(dur.toFixed(2)),
+      ok: false,
+      error: result.error,
+      ...(handlers.log ?? {}),
+    });
+    return result;
   }
-  await child.stdin.close();
 
-  // Drain stderr concurrently so a chatty agy can never block on a full pipe;
-  // .catch keeps a rare drain rejection from becoming an unhandled rejection
-  // that would abort the whole isolate mid-flight.
+  // Drain stderr immediately. A child that writes diagnostics before reading
+  // stdin must never deadlock the prompt-delivery phase on a full stderr pipe.
   const stderrText = new Response(child.stderr).text().catch(() => "");
 
   // Escalating kill: agy (or whatever it spawned) may ignore SIGTERM; SIGKILL
@@ -673,17 +801,53 @@ async function runAgy(
       }, 3_000);
     }
   };
-  const onAbort = () => killHard();
+
+  let resolveAbort: (() => void) | null = null;
+  const aborted = new Promise<"aborted">((resolve) => {
+    resolveAbort = () => resolve("aborted");
+  });
+  const onAbort = () => {
+    killHard();
+    resolveAbort?.();
+  };
   signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
 
   const result: AgyResult = { ok: false, text: "" };
   let recoveredSalvage = false;
   let watchdog: ReturnType<typeof setTimeout> | null = null;
+  const deadline = new Promise<"deadline">((resolve) => {
+    watchdog = setTimeout(() => {
+      killHard();
+      resolve("deadline");
+    }, AGY_HARD_DEADLINE_MS);
+  });
+  let stdinWriteError: unknown;
+  let stdinCloseError: unknown;
+
+  const finishInterrupted = async (outcome: "deadline" | "aborted") => {
+    result.ok = false;
+    if (outcome === "deadline") {
+      result.error ??=
+        `agy hard deadline exceeded (${PRINT_TIMEOUT} + ${HARD_MARGIN_MS}ms margin)`;
+      console.error(
+        `runAgy hard deadline (${model}, ${AGY_HARD_DEADLINE_MS}ms): escalating kill`,
+      );
+    } else {
+      result.error ??= "request aborted";
+    }
+    try {
+      await child.status;
+    } catch {
+      // A settled/rejected status means the direct child no longer consumes a
+      // concurrency slot. Descendants may still hold stdout; never await flow.
+    }
+  };
+
   try {
-    // The flow may never complete on its own: an orphaned run_command
-    // grandchild can hold the stdout pipe open forever (EOF requires ALL
-    // writers to close), and agy itself might hang past --print-timeout.
-    // Hence Promise.race against our own hard deadline below.
+    // Start stdout draining before writing the prompt too. Some child failures
+    // can emit output before they consume stdin; keeping both pipes drained
+    // prevents backpressure from defeating cancellation or the hard deadline.
     const flow = (async () => {
       for await (const line of readLines(child.stdout)) {
         const trimmed = line.trim();
@@ -725,39 +889,79 @@ async function runAgy(
       const status = await child.status;
       if (!result.ok && !result.error) {
         const errText = await stderrText;
-        result.error = errText.trim() || `agy exited with code ${status.code}`;
+        const stdinError = stdinWriteError ?? stdinCloseError;
+        const stdinText = stdinError instanceof Error
+          ? stdinError.message
+          : stdinError == null ? "" : String(stdinError);
+        result.error = errText.trim() ||
+          (stdinText ? `agy stdin failed: ${stdinText}` : `agy exited with code ${status.code}`);
       }
     })();
 
+    // Prompts can exceed Linux argv limits, so they travel over stdin. This
+    // delivery itself is part of the request lifetime: cancellation and the
+    // bridge hard deadline must be able to terminate a child that never reads.
+    const stdinDelivery = (async () => {
+      const stdinWriter = child.stdin.getWriter();
+      try {
+        await stdinWriter.write(
+          enc.encode(JSON.stringify({ event: "user", message: { content: prompt } }) + "\n"),
+        );
+      } catch (error) {
+        stdinWriteError = error;
+      } finally {
+        stdinWriter.releaseLock();
+      }
+      try {
+        await child.stdin.close();
+      } catch (error) {
+        stdinCloseError = error;
+      }
+      return "delivered" as const;
+    })();
+
+    const deliveryOutcome = await Promise.race([
+      stdinDelivery,
+      deadline,
+      aborted,
+    ]);
+    if (deliveryOutcome === "deadline" || deliveryOutcome === "aborted") {
+      await finishInterrupted(deliveryOutcome);
+      return result;
+    }
+
+    // The flow may never complete on its own: an orphaned run_command
+    // grandchild can hold the stdout pipe open forever (EOF requires ALL
+    // writers to close), and agy itself might hang past --print-timeout.
     const outcome = await Promise.race([
       flow.then(() => "done" as const),
-      new Promise<"deadline">((res) => {
-        watchdog = setTimeout(() => res("deadline"), AGY_HARD_DEADLINE_MS);
-      }),
+      deadline,
+      aborted,
     ]);
 
-    if (outcome === "deadline") {
-      if (!result.error) {
-        result.error = `agy hard deadline exceeded (${PRINT_TIMEOUT} + ${HARD_MARGIN_MS}ms margin)`;
-      }
-      console.error(
-        `runAgy hard deadline (${model}, ${AGY_HARD_DEADLINE_MS}ms): escalating kill`,
-      );
-      killHard();
-      // Deliberately NOT awaiting `flow`: orphaned grandchildren may keep the
-      // pipes open indefinitely. The gate must free NOW; the zombie flow keeps
-      // draining harmlessly with commit/evict skipped by the guard below.
+    if (outcome === "deadline" || outcome === "aborted") {
+      await finishInterrupted(outcome);
+    } else if (stdinWriteError != null) {
+      const stdinText = stdinWriteError instanceof Error
+        ? stdinWriteError.message
+        : String(stdinWriteError);
+      result.ok = false;
+      result.error = `agy stdin failed: ${stdinText || "write failed"}`;
     }
-    // (deadline timer cleanup happens in `finally`)
 
-    // Conversation-store side effects only on clean completion — a deadline
-    // or abort must never leave stale conversation entries behind.
+    // Conversation-store success side effects only on clean completion. Any
+    // failed reused run is evicted across all lifecycle exits, including an
+    // agy ERROR whose final report is later salvaged for the client.
     if (outcome === "done") {
       if (result.ok && result.conversationId) handlers.commit?.(result.conversationId);
       if (!result.ok && conversationId) handlers.evict?.();
       // Natural agy-side failure after real work: try to salvage the finished
-      // report from the session transcript before failing the client.
-      if (!result.ok && result.conversationId && !signal?.aborted) {
+      // report from the session transcript before failing the client. A prompt
+      // write failure is not salvageable: that transcript may be unrelated.
+      if (
+        !result.ok && result.conversationId && !signal?.aborted &&
+        stdinWriteError == null
+      ) {
         const salvaged = await salvageFinalResponse(result.conversationId);
         if (salvaged !== null) {
           result.text = salvaged;
@@ -770,8 +974,9 @@ async function runAgy(
       }
     }
   } finally {
+    if (!result.ok && conversationId) handlers.evict?.();
     if (watchdog !== null) clearTimeout(watchdog);
-    if (escalateTimer !== null) clearTimeout(escalateTimer);
+    if (escalateTimer !== null && exited) clearTimeout(escalateTimer);
     signal?.removeEventListener("abort", onAbort);
     release();
     const dur = (Date.now() - started) / 1000;
@@ -991,6 +1196,9 @@ async function handleChat(req: Request): Promise<Response> {
   if (!model) return jsonError(400, "missing model");
   const auto = parseAutoModel(model);
   if (auto) {
+    if (!autoContentIsTextOnly(body)) {
+      return jsonError(400, "auto-* routes currently accept text-only message content");
+    }
     const declared = groupBases(modelSlugs);
     // All accepted body signals (flat reasoning_effort, nested
     // reasoning.effort, variant) funnel through variantSignals; the slug
@@ -1009,45 +1217,93 @@ async function handleChat(req: Request): Promise<Response> {
     );
   }
 
-  const prepared = await preparePrompt(body, model);
+  let workspace: RequestWorkspace;
+  try {
+    workspace = await createRequestWorkspace(STATE_DIR);
+  } catch (error) {
+    console.error("request workspace creation failed:", error);
+    return jsonError(500, "failed to create isolated request workspace");
+  }
+
+  let normalizedBody: OAIChatRequest;
+  let prepared: PreparedPrompt;
+  try {
+    normalizedBody = await normalizeBareRequest(body, workspace);
+    prepared = await preparePrompt(normalizedBody, model);
+  } catch (error) {
+    await cleanupWorkspace(workspace);
+    if (error instanceof AttachmentInputError) {
+      return jsonError(error.status, error.message);
+    }
+    console.error("request workspace preparation failed:", error);
+    return jsonError(500, "failed to prepare isolated request");
+  }
+
   const { prompt } = prepared;
-  const useTools = TOOLS_ENABLED && (body.tools?.length ?? 0) > 0;
+  const useTools = TOOLS_ENABLED && (normalizedBody.tools?.length ?? 0) > 0;
   const log = {
     continued: prepared.continued,
-    msgs: body.messages?.length ?? 0,
+    msgs: normalizedBody.messages?.length ?? 0,
     prompt_chars: prompt.length,
     tools_chars: prepared.toolsChars,
     system_chars: prepared.systemChars,
     history_chars: prepared.historyChars,
     delta_chars: 0,
   };
-  const stream = body.stream === true;
+  const stream = normalizedBody.stream === true;
   const id = genId();
   const created = Math.floor(Date.now() / 1000);
 
   if (!stream) {
-    let r = await runAgy(
-      model,
-      prompt,
-      { log, commit: prepared.commit, evict: prepared.evict },
-      req.signal,
-      prepared.conversationId,
-    );
-    if (!r.ok && prepared.continued) {
-      // stale conversation (expired/deleted): retry once as a fresh one
-      const fresh = await preparePrompt(body, model);
-      r = await runAgy(model, fresh.prompt, {
-        log: { ...log, continued: false },
-        commit: fresh.commit,
-      }, req.signal);
-    }
-    if (!r.ok) return jsonError(502, r.error ?? "agy failed");
-    if (useTools) {
-      const { content, tool_calls } = parseToolCalls(r.text);
-      const message: Record<string, unknown> = { role: "assistant", content };
-      if (tool_calls.length) {
-        message.tool_calls = tool_calls;
-        message.content = content || null;
+    try {
+      let r = await runAgy(
+        model,
+        prompt,
+        { log, commit: prepared.commit, evict: prepared.evict },
+        req.signal,
+        prepared.conversationId,
+        AGY_AGENT,
+        workspace.dir,
+      );
+      if (!r.ok && prepared.continued) {
+        // A failed continuation may not have reached runAgy's normal
+        // completion-side eviction path (for example spawn/deadline/abort).
+        // Evict first so the retry is genuinely fresh and gets full history.
+        prepared.evict?.();
+        const fresh = await preparePrompt(normalizedBody, model);
+        r = await runAgy(
+          model,
+          fresh.prompt,
+          {
+            log: { ...log, continued: false },
+            commit: fresh.commit,
+          },
+          req.signal,
+          undefined,
+          AGY_AGENT,
+          workspace.dir,
+        );
+      }
+      if (!r.ok) return jsonError(502, r.error ?? "agy failed");
+      if (useTools) {
+        const { content, tool_calls } = parseToolCalls(r.text);
+        const message: Record<string, unknown> = { role: "assistant", content };
+        if (tool_calls.length) {
+          message.tool_calls = tool_calls;
+          message.content = content || null;
+        }
+        return Response.json({
+          id,
+          object: "chat.completion",
+          created,
+          model,
+          choices: [{
+            index: 0,
+            message,
+            finish_reason: tool_calls.length ? "tool_calls" : "stop",
+          }],
+          usage: oaiUsage(r.usage),
+        });
       }
       return Response.json({
         id,
@@ -1056,28 +1312,19 @@ async function handleChat(req: Request): Promise<Response> {
         model,
         choices: [{
           index: 0,
-          message,
-          finish_reason: tool_calls.length ? "tool_calls" : "stop",
+          message: { role: "assistant", content: r.text },
+          finish_reason: "stop",
         }],
         usage: oaiUsage(r.usage),
       });
+    } finally {
+      await cleanupWorkspace(workspace);
     }
-    return Response.json({
-      id,
-      object: "chat.completion",
-      created,
-      model,
-      choices: [{
-        index: 0,
-        message: { role: "assistant", content: r.text },
-        finish_reason: "stop",
-      }],
-      usage: oaiUsage(r.usage),
-    });
   }
 
-  // streaming: if tool protocol is active we must buffer the whole response
-  // to parse <tool_call> blocks; otherwise we stream text deltas.
+  // Streaming keeps the workspace alive for the entire SSE lifetime. The
+  // existing stream-json/tool behavior remains unchanged; only child cwd and
+  // cleanup ownership differ from the pre-isolation path.
   const sse = new ReadableStream<Uint8Array>({
     async start(controller) {
       // Same self-defending sender pattern as the autonomous stream: a
@@ -1120,6 +1367,8 @@ async function handleChat(req: Request): Promise<Response> {
             },
             req.signal,
             prepared.conversationId,
+            AGY_AGENT,
+            workspace.dir,
           );
           classifier.flush();
           if (!r.ok) {
@@ -1128,10 +1377,24 @@ async function handleChat(req: Request): Promise<Response> {
             const { tool_calls } = parseToolCalls(r.text);
             if (tool_calls.length) {
               chunk({ role: "assistant", tool_calls }, "tool_calls");
-              send({ id, object: "chat.completion.chunk", created, model, choices: [], usage: oaiUsage(r.usage) });
+              send({
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model,
+                choices: [],
+                usage: oaiUsage(r.usage),
+              });
             } else {
               chunk({}, "stop");
-              send({ id, object: "chat.completion.chunk", created, model, choices: [], usage: oaiUsage(r.usage) });
+              send({
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model,
+                choices: [],
+                usage: oaiUsage(r.usage),
+              });
             }
           }
         } else {
@@ -1139,18 +1402,33 @@ async function handleChat(req: Request): Promise<Response> {
             chunk: (d) => chunk(d),
             log,
           });
-          const r = await runAgy(model, prompt, {
-            onDelta: (kind, d) => classifier.onDelta(kind, d),
-            log,
-            commit: prepared.commit,
-            evict: prepared.evict,
-          }, req.signal, prepared.conversationId);
+          const r = await runAgy(
+            model,
+            prompt,
+            {
+              onDelta: (kind, d) => classifier.onDelta(kind, d),
+              log,
+              commit: prepared.commit,
+              evict: prepared.evict,
+            },
+            req.signal,
+            prepared.conversationId,
+            AGY_AGENT,
+            workspace.dir,
+          );
           classifier.flush();
           if (!r.ok) {
             send({ error: { message: r.error ?? "agy failed", code: 502 } });
           } else {
             chunk({}, "stop");
-            send({ id, object: "chat.completion.chunk", created, model, choices: [], usage: oaiUsage(r.usage) });
+            send({
+              id,
+              object: "chat.completion.chunk",
+              created,
+              model,
+              choices: [],
+              usage: oaiUsage(r.usage),
+            });
           }
         }
       } catch (e) {
@@ -1164,6 +1442,7 @@ async function handleChat(req: Request): Promise<Response> {
         try {
           controller.close();
         } catch { /* already closed */ }
+        await cleanupWorkspace(workspace);
       }
     },
   });

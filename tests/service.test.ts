@@ -399,6 +399,11 @@ done
   });
 
   try {
+    // /healthz is only liveness; explicitly load the mock catalog so this test
+    // measures the subprocess deadline rather than racing model discovery.
+    const models = await fetch(`http://127.0.0.1:${harness.port}/v1/models`);
+    assertEquals(models.status, 200);
+
     const start = Date.now();
     const res = await fetch(
       `http://127.0.0.1:${harness.port}/v1/chat/completions`,
@@ -432,6 +437,7 @@ if [ "$1" = "models" ]; then
   exit 0
 fi
 
+read -r line
 # Emit ERROR result with conversation_id
 printf '{"event":"result","result":{"status":"ERROR","error":"trailing failure","conversation_id":"${convId}"}}\\n'
 exit 1
@@ -483,6 +489,7 @@ if [ "$1" = "models" ]; then
   exit 0
 fi
 
+read -r line
 # Check if --conversation is present
 has_conv=0
 for arg in "$@"; do

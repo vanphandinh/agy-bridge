@@ -8,7 +8,7 @@ ExecStart=${DENO_BIN} run \
   --allow-net=127.0.0.1 \
   --allow-run=${AGY_BIN} \
   --allow-write=%h/.local/state/agy-bridge \
-  --allow-read=%h/.gemini/antigravity-cli/brain \
+  --allow-read=%h/.gemini/antigravity-cli/brain,%h/.local/state/agy-bridge \
   --allow-env \
   --unstable-no-legacy-abort \
   ${INSTALL_DIR}/agy-bridge.ts

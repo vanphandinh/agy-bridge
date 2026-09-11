@@ -68,9 +68,10 @@ Si el primer comando no devuelve `{"ok":true}`, andá a
 ## Uso diario
 
 - **Elegí modelo por perfil:** `auto-ro-<base>` (solo lectura) o
-  `auto-rw-<base>` (lectura/escritura). Cada tarea autónoma = 1 request = 1
-  sesión agy (~7.4k tokens de overhead en `ro`, ~9.8k en `rw`). Nunca uses ids
-  bare `gemini-*`/`claude-*` en el provider.
+  `auto-rw-<base>` (lectura/escritura) para tareas agentic sobre archivos
+  locales. Para llamadas directas a la API OpenAI-compatible, los ids bare
+  `gemini-*`/`claude-*` corren en un workspace vacío y aislado por request.
+  Las rutas `auto-*` conservan su `cwd` heredado y siguen siendo text-only.
 - **Variantes de esfuerzo:** cada modelo trae `variants`
   (`high`/`medium`/`low`/`thinking`); si no elegís variante, se aplica
   `medium` → `high` → `low` → `thinking`.
@@ -81,6 +82,27 @@ Si el primer comando no devuelve `{"ok":true}`, andá a
   (verificado en vivo el 2026-09-07). Resincronizar en cualquier momento:
   `deno task sync:models` ([cómo funciona](docs/installer-internals.md#sincronización-de-modelos)).
 
+### Multimodal en modelos bare
+
+Los modelos bare aceptan `messages[].content` como texto o como partes OpenAI
+`text` + `image_url`. `image_url.url` debe ser un `data:<mime>;base64,...`
+soportado: el bridge decodifica el archivo dentro de
+`$STATE_DIR/work/req-<random>/`, pasa ese directorio como `cwd` del `agy`
+oficial y lo elimina al terminar la respuesta (también en SSE). El bridge
+**no descarga URLs `http://`/`https://`** y las rechaza con HTTP 400.
+
+Los límites se aplican a bytes decodificados: 20 MiB por archivo y 64 MiB por
+request por defecto, configurables con `AGY_MAX_ATTACHMENT_BYTES` y
+`AGY_MAX_REQUEST_ATTACHMENT_BYTES`. Las rutas `auto-ro-*`/`auto-rw-*` siguen
+text-only para conservar su semántica agentic y su directorio de trabajo.
+Todo acceso a Google continúa ocurriendo únicamente dentro del binario oficial
+`agy`; el bridge no lee OAuth ni llama endpoints privados de Google.
+
+El `cwd` aislado evita exposición accidental del checkout, pero **no es un
+sandbox del sistema operativo**: `agy` sigue corriendo como el mismo usuario.
+Los tests usan un mock hermético; después de instalar, verificá `view_file` con
+el CLI oficial y con los tipos de archivo que realmente vayas a usar.
+
 Contrato del modelo (forma plana, `reasoning: true`, sin `capabilities`) y
 matriz de variantes: [`docs/model-contract.md`](docs/model-contract.md).
 
@@ -90,6 +112,10 @@ matriz de variantes: [`docs/model-contract.md`](docs/model-contract.md).
 2. Re-corré el instalador (el mismo one-liner de
    [instalación](#instalación-en-3-pasos)) o `./install.sh` desde el repo; esto
    resincroniza los modelos en vivo y reaplica el parche de TUI si hace falta.
+   El instalador migra automáticamente solo el `raw/agent.md` canonical de la
+   versión anterior para habilitar lectura de attachments aislados. Si ya
+   personalizaste ese agente, lo preserva: aplicá manualmente la excepción
+   `view_file` para `attachment-NNN.*` o usá `--force` si querés reemplazarlo.
 3. Solo modelos, sin instalador completo: `deno task sync:models`
    (`--dry-run` para previsualizar sin escribir).
 
@@ -123,7 +149,9 @@ Comandos exactos: [`docs/installer-internals.md`](docs/installer-internals.md#ro
 Limitaciones conocidas: latencia de arranque del proceso agy por turno
 (~2-7s); los thinking tokens se contabilizan en usage pero no se muestran; en
 stream los tool-calls se bufferizan (sin deltas); `temperature`/`max_tokens` se
-ignoran (agy no los expone).
+ignoran (agy no los expone); el aislamiento por `cwd` no reemplaza un sandbox
+OS y la compatibilidad real de `view_file` depende de la versión instalada de
+Antigravity CLI.
 
 ## Config esencial
 
@@ -140,20 +168,23 @@ Valores por defecto en [`.env.example`](.env.example):
 | `AGY_TOOLS` | `on` | `off` = desactiva protocolo de tools en `raw` |
 | `AGY_TOOL_SCHEMA` | `full` | `slim` = menos tokens en `raw` |
 | `AGY_REUSE` | `off` | `on` = continúa conversaciones `raw` (no aplica en `auto-*`) |
+| `AGY_MAX_ATTACHMENT_BYTES` | `20971520` | Máximo decodificado por attachment (20 MiB) |
+| `AGY_MAX_REQUEST_ATTACHMENT_BYTES` | `67108864` | Máximo decodificado total por request (64 MiB) |
 | `AGY_TOKEN` | *requerido* | `Authorization: Bearer <AGY_TOKEN>` |
 
 ## Para desarrolladores y operadores
 
 - [`docs/architecture.md`](docs/architecture.md) — diagrama, stdin NDJSON
-  (`E2BIG`/190 KB), invariantes completas, sesiones y tokens, delegación
-  autónoma, protocolo de tools, clasificador de streaming.
+  (`E2BIG`/190 KB), invariantes completas, sesiones y tokens, aislamiento bare,
+  attachments, delegación autónoma, protocolo de tools y streaming.
 - [`docs/model-contract.md`](docs/model-contract.md) — contrato plano del
   modelo (`reasoning: true`, sin `capabilities`), variantes y `reasoningEffort`,
-  snapshot 7 bases/14 ids (2026-09-07), ids bare prohibidos.
+  snapshot 7 bases/14 ids (2026-09-07), ids bare no expuestos en el provider.
 - [`docs/installer-internals.md`](docs/installer-internals.md) — instalador
   canónico, instalación manual paso a paso, bundle del plugin
   (`deno task bundle:plugin`), sincronización en 3 niveles, parche del TUI,
   auth sin secretos en repo, verificación completa, rollback.
-- [`docs/testing.md`](docs/testing.md) — suite verde (`deno task test`;
-  80/80 verificado en vivo el 2026-09-08 — re-verificá con el comando),
-  smoke tests, diagnóstico y SDD.
+- [`docs/testing.md`](docs/testing.md) — suite y cobertura actual (`deno task
+  test`), smoke tests, diagnóstico y SDD.
+- [`docs/third-party-notices.md`](docs/third-party-notices.md) — atribución de
+  las ideas reimplementadas para aislamiento por request y staging de data URI.

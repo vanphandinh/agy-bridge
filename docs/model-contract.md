@@ -8,7 +8,7 @@
 El provider `agy-bridge` publica cada modelo en forma plana: `reasoning: true`
 a nivel del modelo + `variants.*.reasoningEffort`, **sin objeto
 `capabilities`**. Verificado con `cat ~/.config/opencode/opencode.json | jq`
-y suite verde (`deno task test`; 80/80 verificado en vivo el 2026-09-08).
+y la suite verde (`deno task test`).
 
 Sin embargo, el SDK `@ai-sdk/openai-compatible` que usa `opencode` enriquece
 el modelo y deja `capabilities.reasoning` en `false` (o ausente) en
