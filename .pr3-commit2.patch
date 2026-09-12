@@ -1,0 +1,433 @@
+diff --git a/Dockerfile b/Dockerfile
+index 77b0725..98fc832 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -16,6 +16,7 @@ RUN apt-get update \
+ 
+ RUN groupadd --gid 10001 agy \
+  && useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash agy \
++ && install -d -m 0755 -o agy -g agy /workspace \
+  && install -d -m 0700 -o agy -g agy /home/agy/.cache \
+  && install -d -m 0700 -o agy -g agy \
+       /home/agy/.cache/deno \
+diff --git a/agents/agy-bridge-worker-ro-v1/agent.md b/agents/agy-bridge-worker-ro-v1/agent.md
+new file mode 100644
+index 0000000..ef42f38
+--- /dev/null
++++ b/agents/agy-bridge-worker-ro-v1/agent.md
+@@ -0,0 +1,29 @@
++---
++name: agy-bridge-worker-ro-v1
++description: Read-only bridge workspace worker for the explicitly mounted Docker workspace.
++tools:
++  - view_file
++  - list_dir
++  - grep_search
++  - find_by_name
++mainAgent: true
++subagent: false
++commandExecutionPolicy: off
++mcpServers: []
++skills: []
++plugins: []
++---
++
++You are the read-only worker for the Docker bridge's explicitly mounted caller project.
++
++The sole caller project root is `/workspace`. Treat no other path as caller project data.
++You may inspect and search files only under `/workspace` using the declared read-only tools.
++
++Do not treat `/app`, `$HOME`, the bridge process working directory, Antigravity configuration,
++bridge state, keyring storage, or secret storage as caller project files. Do not attempt to read
++or disclose those locations, including through `..`, symlinks, alternate path spellings, or any
++other traversal.
++
++The caller workspace is read-only. Never create, modify, delete, rename, or execute project files.
++Do not run commands. Do not invoke MCP servers, plugins, skills, web tools, or undeclared tools.
++If a request requires mutation or execution, explain that the read-only workspace cannot perform it.
+diff --git a/agy-bridge.ts b/agy-bridge.ts
+index a95078d..0b9fc43 100644
+--- a/agy-bridge.ts
++++ b/agy-bridge.ts
+@@ -55,6 +55,39 @@ const STATE_DIR = Deno.env.get("STATE_DIR") ??
+   `${Deno.env.get("HOME")}/.local/state/agy-bridge`;
+ const USAGE_LOG = `${STATE_DIR}/usage.jsonl`;
+ 
++type WorkspaceMode = "ro";
++
++interface WorkspaceConfig {
++  root: "/workspace";
++  mode: WorkspaceMode;
++}
++
++function loadWorkspaceConfig(): WorkspaceConfig | null {
++  const root = Deno.env.get("AGY_WORKSPACE_ROOT");
++  const mode = Deno.env.get("AGY_WORKSPACE_MODE");
++  if (!root && !mode) return null;
++  if (root !== "/workspace") {
++    throw new Error("AGY_WORKSPACE_ROOT must be /workspace");
++  }
++  if (mode !== "ro") {
++    throw new Error("AGY_WORKSPACE_MODE must be ro");
++  }
++  if (MAX_CONCURRENT !== 1) {
++    throw new Error("workspace mode requires MAX_CONCURRENT=1");
++  }
++  return { root, mode };
++}
++
++const WORKSPACE = loadWorkspaceConfig();
++const WORKSPACE_AGENT = "agy-bridge-worker-ro-v1";
++const WORKSPACE_CONTRACT = `# Bridge workspace contract
++
++The operator explicitly exposed one caller project at /workspace in read-only mode.
++Treat /workspace as the caller project root.
++Do not treat /app, HOME, the bridge process directory, bridge state, configuration, keyring data, or secrets as caller project files.
++Use project filesystem tools only within /workspace.
++The workspace is read-only. Never create, modify, delete, or execute project files.`;
++
+ // ---------- autonomous delegation (models prefixed "auto-<profile>-") ----------
+ //
+ // "auto-ro-gemini-3.7-flash-high" runs ONE agy session with the profile's own
+@@ -121,6 +154,26 @@ function childEnv(): Record<string, string> {
+   return env;
+ }
+ 
++const WORKSPACE_CHILD_ENV_ALLOWLIST = [
++  "HOME",
++  "PATH",
++  "LANG",
++  "LC_ALL",
++  "TERM",
++  "DBUS_SESSION_BUS_ADDRESS",
++  "XDG_RUNTIME_DIR",
++] as const;
++
++function workspaceChildEnv(): Record<string, string> {
++  const source = Deno.env.toObject();
++  const env: Record<string, string> = {};
++  for (const key of WORKSPACE_CHILD_ENV_ALLOWLIST) {
++    const value = source[key];
++    if (value !== undefined) env[key] = value;
++  }
++  return env;
++}
++
+ async function runCapture(cmd: string[], opts: { timeoutMs?: number } = {}) {
+   const child = new Deno.Command(cmd[0], {
+     args: cmd.slice(1),
+@@ -388,8 +441,12 @@ When finished, your final message must be the complete deliverable requested:
+ self-contained and ready to be consumed by an orchestrator without further
+ context.`;
+ 
+-function renderAutonomousPrompt(req: OAIChatRequest): RenderedPrompt {
++function renderAutonomousPrompt(
++  req: OAIChatRequest,
++  trustedSystem?: string,
++): RenderedPrompt {
+   const system: string[] = [];
++  if (trustedSystem) system.push(trustedSystem);
+   for (const m of req.messages ?? []) {
+     if (m.role === "system") {
+       const text = textContent(m).trim();
+@@ -609,6 +666,11 @@ interface AgyStreamHandlers {
+   evict?: () => void;
+ }
+ 
++interface AgyExecutionContext {
++  cwd?: string;
++  workspaceReadOnly?: boolean;
++}
++
+ async function runAgy(
+   model: string,
+   prompt: string,
+@@ -616,6 +678,7 @@ async function runAgy(
+   signal?: AbortSignal,
+   conversationId?: string,
+   agent: string = AGY_AGENT,
++  execution: AgyExecutionContext = {},
+ ): Promise<AgyResult> {
+   const release = await acquire();
+   const started = Date.now();
+@@ -644,7 +707,8 @@ async function runAgy(
+       stdout: "piped",
+       stderr: "piped",
+       stdin: "piped",
+-      env: childEnv(),
++      cwd: execution.cwd,
++      env: execution.workspaceReadOnly ? workspaceChildEnv() : childEnv(),
+       clearEnv: true,
+     }).spawn();
+ 
+@@ -925,10 +989,21 @@ async function handleAutonomousChat(
+   modelStr: string,
+   auto: AutoRoute,
+ ): Promise<Response> {
+-  const prepared = renderAutonomousPrompt(body);
++  const workspaceReadOnly = WORKSPACE !== null && auto.profile === "ro";
++  const selectedAgent = workspaceReadOnly ? WORKSPACE_AGENT : auto.agent;
++  const execution: AgyExecutionContext = workspaceReadOnly
++    ? { cwd: WORKSPACE.root, workspaceReadOnly: true }
++    : {};
++  const prepared = renderAutonomousPrompt(
++    body,
++    workspaceReadOnly ? WORKSPACE_CONTRACT : undefined,
++  );
+   const log = {
+     autonomous: auto.profile,
+-    agent: auto.agent,
++    agent: selectedAgent,
++    ...(workspaceReadOnly
++      ? { workspace_enabled: true, workspace_mode: "ro", workspace_root: "/workspace" }
++      : {}),
+     msgs: body.messages?.length ?? 0,
+     prompt_chars: prepared.prompt.length,
+     tools_chars: 0,
+@@ -946,7 +1021,8 @@ async function handleAutonomousChat(
+       { log },
+       req.signal,
+       undefined,
+-      auto.agent,
++      selectedAgent,
++      execution,
+     );
+     if (!r.ok) return jsonError(502, r.error ?? "agy failed");
+     return Response.json({
+@@ -1003,7 +1079,7 @@ async function handleAutonomousChat(
+         const r = await runAgy(auto.real, streamingPrompt, {
+           onDelta: (kind, d) => classifier.onDelta(kind, d),
+           log,
+-        }, req.signal, undefined, auto.agent);
++        }, req.signal, undefined, selectedAgent, execution);
+         classifier.flush();
+         if (!r.ok) {
+           send({ error: { message: r.error ?? "agy failed", code: 502 } });
+@@ -1064,6 +1140,12 @@ async function handleChat(req: Request): Promise<Response> {
+   if (!model) return jsonError(400, "missing model");
+   const auto = parseAutoModel(model);
+   if (auto) {
++    if (WORKSPACE && auto.profile === "rw") {
++      return jsonError(
++        403,
++        "workspace is read-only; read-write host workspace support is not enabled",
++      );
++    }
+     const declared = groupBases(modelSlugs);
+     // All accepted body signals (flat reasoning_effort, nested
+     // reasoning.effort, variant) funnel through variantSignals; the slug
+diff --git a/docker/start-bridge.sh b/docker/start-bridge.sh
+index 35eca95..93fbd05 100644
+--- a/docker/start-bridge.sh
++++ b/docker/start-bridge.sh
+@@ -19,7 +19,7 @@ export KEYRING_PASSWORD_FILE="$keyring_password_file"
+ 
+ agents_dir="$HOME/.gemini/config/agents"
+ mkdir -p "$agents_dir"
+-for profile in raw worker-ro worker-rw; do
++for profile in raw worker-ro worker-rw agy-bridge-worker-ro-v1; do
+   src="/app/agents/$profile/agent.md"
+   dst_dir="$agents_dir/$profile"
+   [[ -f "$src" ]] || { echo "missing managed agent: $src" >&2; exit 66; }
+diff --git a/docker/tests/fake-agy.sh b/docker/tests/fake-agy.sh
+index e7763fd..c0699d1 100644
+--- a/docker/tests/fake-agy.sh
++++ b/docker/tests/fake-agy.sh
+@@ -5,16 +5,23 @@ if [[ "${1:-}" == "models" ]]; then
+   printf 'gemini-test-high\tGemini Test High\n'
+   exit 0
+ fi
++home="${HOME:-/tmp}"
++args_file="${FAKE_AGY_ARGS_FILE:-$home/fake-agy-args.txt}"
++capture_file="${FAKE_AGY_CAPTURE_FILE:-$home/fake-agy-input.ndjson}"
++cwd_file="${FAKE_AGY_CWD_FILE:-$home/fake-agy-cwd.txt}"
++env_file="${FAKE_AGY_ENV_FILE:-$home/fake-agy-env.txt}"
++count_file="${FAKE_AGY_COUNT_FILE:-$home/fake-agy-count.txt}"
+ 
+-if [[ -n "${FAKE_AGY_ARGS_FILE:-}" ]]; then
+-  printf '%s\n' "$*" > "$FAKE_AGY_ARGS_FILE"
+-fi
++printf '%s\n' "$*" > "$args_file"
++pwd -P > "$cwd_file"
++env | sort > "$env_file"
++count=0
++if [[ -f "$count_file" ]]; then count="$(cat "$count_file")"; fi
++printf '%s\n' "$((count + 1))" > "$count_file"
+ 
+ # The real bridge writes one NDJSON prompt to stdin before consuming output.
+ # Drain it so the writer cannot hit EPIPE if the fake exits too early.
+ input="$(cat || true)"
+-if [[ -n "${FAKE_AGY_CAPTURE_FILE:-}" ]]; then
+-  printf '%s\n' "$input" > "$FAKE_AGY_CAPTURE_FILE"
+-fi
++printf '%s\n' "$input" > "$capture_file"
+ printf '%s\n' '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"fake reply"}}'
+ printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"fake reply","conversation_id":"fake-conversation","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}'
+diff --git a/docker/tests/test-bridge.sh b/docker/tests/test-bridge.sh
+index 292f7e4..282af8b 100644
+--- a/docker/tests/test-bridge.sh
++++ b/docker/tests/test-bridge.sh
+@@ -8,27 +8,43 @@ trap 'kill ${bridge_pid:-0} 2>/dev/null || true; rm -rf "$work"' EXIT
+ export AGY_BIN=/app/docker/tests/fake-agy.sh
+ export AGY_TOKEN=0123456789abcdef0123456789abcdef0123456789abcdef
+ export HOSTNAME=127.0.0.1
+-export PORT=17421
+ export STATE_DIR="$work/state"
+ export HOME="$work/home"
+ export FAKE_AGY_CAPTURE_FILE="$work/agy-input.ndjson"
+ export FAKE_AGY_ARGS_FILE="$work/agy-args.txt"
++export FAKE_AGY_CWD_FILE="$work/agy-cwd.txt"
++export FAKE_AGY_ENV_FILE="$work/agy-env.txt"
++export FAKE_AGY_COUNT_FILE="$work/agy-count.txt"
+ mkdir -p "$HOME/.gemini" "$STATE_DIR"
+ 
+-deno run \
+-  --allow-net=127.0.0.1:17421 \
+-  --allow-env \
+-  --allow-run="$AGY_BIN" \
+-  --allow-read="$HOME/.gemini/antigravity-cli/brain" \
+-  --allow-write="$STATE_DIR" \
+-  /app/agy-bridge.ts >"$work/bridge.out" 2>"$work/bridge.err" &
+-bridge_pid=$!
+-
+-for _ in $(seq 1 50); do
+-  curl -fsS http://127.0.0.1:17421/healthz >/dev/null 2>&1 && break
+-  sleep 0.1
+-done
+-curl -fsS http://127.0.0.1:17421/healthz >/dev/null || fail "bridge never became healthy"
++start_bridge() {
++  local port="$1"
++  export PORT="$port"
++  deno run \
++    --allow-net="127.0.0.1:$port" \
++    --allow-env \
++    --allow-run="$AGY_BIN" \
++    --allow-read="$HOME/.gemini/antigravity-cli/brain" \
++    --allow-write="$STATE_DIR" \
++    /app/agy-bridge.ts >"$work/bridge-$port.out" 2>"$work/bridge-$port.err" &
++  bridge_pid=$!
++
++  for _ in $(seq 1 50); do
++    curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && break
++    sleep 0.1
++  done
++  curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null || fail "bridge never became healthy on $port"
++}
++
++stop_bridge() {
++  kill "$bridge_pid" 2>/dev/null || true
++  wait "$bridge_pid" 2>/dev/null || true
++  bridge_pid=0
++}
++
++# ----- default/no-workspace regression -----
++unset AGY_WORKSPACE_ROOT AGY_WORKSPACE_MODE AGY_WORKSPACE_HOST_PATH
++start_bridge 17421
+ 
+ code="$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:17421/v1/models)"
+ assert_eq "$code" 401
+@@ -63,27 +79,91 @@ auto_ro="$(curl -fsS \
+   -d '{"model":"auto-ro-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"Reply exactly WORKER_RO_OK. Do not use tools."}]}' \
+   http://127.0.0.1:17421/v1/chat/completions)"
+ [[ "$auto_ro" == *'fake reply'* ]] || fail "auto-ro reply missing"
+-[[ -s "$FAKE_AGY_ARGS_FILE" ]] || fail "fake agy did not capture arguments"
+ ro_args="$(cat "$FAKE_AGY_ARGS_FILE")"
+-[[ "$ro_args" == *'--agent worker-ro'* ]] || fail "auto-ro did not route to worker-ro"
+-[[ -s "$FAKE_AGY_CAPTURE_FILE" ]] || fail "fake agy did not capture autonomous stdin"
++[[ "$ro_args" == *'--agent worker-ro'* ]] || fail "default auto-ro did not route to worker-ro"
+ captured_prompt="$(deno eval --allow-read="$FAKE_AGY_CAPTURE_FILE" '
+   const raw = await Deno.readTextFile(Deno.args[0]);
+   const ev = JSON.parse(raw.trim());
+   console.log(ev.message?.content ?? "");
+ ' "$FAKE_AGY_CAPTURE_FILE")"
+-[[ "$captured_prompt" != *'The absolute workspace root for this delegated task is'* ]] || \
+-  fail "autonomous prompt must not infer a caller workspace from the bridge cwd"
+-[[ "$captured_prompt" != *'Pass absolute paths rooted here to filesystem tools'* ]] || \
+-  fail "autonomous prompt must not inject deployment-specific workspace guidance"
++[[ "$captured_prompt" != *'# Bridge workspace contract'* ]] || fail "default prompt contains workspace contract"
+ 
+-auto_rw="$(curl -fsS \
++curl -fsS \
+   -H 'content-type: application/json' \
+   -H "Authorization: Bearer $AGY_TOKEN" \
+-  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"Reply exactly WORKER_RW_OK. Do not modify files and do not run commands."}]}' \
+-  http://127.0.0.1:17421/v1/chat/completions)"
+-[[ "$auto_rw" == *'fake reply'* ]] || fail "auto-rw reply missing"
++  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"Reply exactly WORKER_RW_OK."}]}' \
++  http://127.0.0.1:17421/v1/chat/completions >/dev/null
+ rw_args="$(cat "$FAKE_AGY_ARGS_FILE")"
+-[[ "$rw_args" == *'--agent worker-rw'* ]] || fail "auto-rw did not route to worker-rw"
++[[ "$rw_args" == *'--agent worker-rw'* ]] || fail "default auto-rw did not route to worker-rw"
++stop_bridge
++
++# Invalid workspace contracts must fail before the HTTP server starts.
++assert_workspace_config_rejected() {
++  local name="$1" root="$2" mode="$3" max="$4"
++  if env \
++    AGY_WORKSPACE_ROOT="$root" \
++    AGY_WORKSPACE_MODE="$mode" \
++    MAX_CONCURRENT="$max" \
++    PORT=17429 \
++    deno run \
++      --allow-net=127.0.0.1:17429 \
++      --allow-env \
++      --allow-run="$AGY_BIN" \
++      --allow-read="$HOME/.gemini/antigravity-cli/brain" \
++      --allow-write="$STATE_DIR" \
++      /app/agy-bridge.ts >"$work/reject-$name.out" 2>"$work/reject-$name.err"; then
++    fail "invalid workspace config was accepted: $name"
++  fi
++}
++assert_workspace_config_rejected bad-root /not-workspace ro 1
++assert_workspace_config_rejected bad-mode /workspace rw 1
++assert_workspace_config_rejected bad-concurrency /workspace ro 2
++
++# ----- explicit read-only workspace runtime -----
++rm -f "$work"/agy-{input.ndjson,args.txt,cwd.txt,env.txt,count.txt}
++export AGY_WORKSPACE_ROOT=/workspace
++export AGY_WORKSPACE_MODE=ro
++export AGY_WORKSPACE_HOST_PATH='HOST_PATH_MUST_NOT_REACH_CHILD'
++export AGY_WORKSPACE_BRIDGE_CANARY='BRIDGE_CANARY_MUST_NOT_REACH_CHILD'
++export AGY_SECRETS_DIR="$work/secrets"
++export KEYRING_PASSWORD_FILE="$work/keyring-password"
++mkdir -p "$AGY_SECRETS_DIR"
++start_bridge 17422
++
++workspace_ro="$(curl -fsS \
++  -H 'content-type: application/json' \
++  -H "Authorization: Bearer $AGY_TOKEN" \
++  -d '{"model":"auto-ro-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"Inspect the caller project."}]}' \
++  http://127.0.0.1:17422/v1/chat/completions)"
++[[ "$workspace_ro" == *'fake reply'* ]] || fail "workspace auto-ro reply missing"
++
++workspace_args="$(cat "$HOME/fake-agy-args.txt")"
++[[ "$workspace_args" == *'--agent agy-bridge-worker-ro-v1'* ]] || fail "workspace auto-ro did not use reserved agent"
++assert_eq "$(cat "$HOME/fake-agy-cwd.txt")" /workspace
++workspace_prompt="$(deno eval --allow-read="$HOME/fake-agy-input.ndjson" '
++  const raw = await Deno.readTextFile(Deno.args[0]);
++  const ev = JSON.parse(raw.trim());
++  console.log(ev.message?.content ?? "");
++' "$HOME/fake-agy-input.ndjson")"
++[[ "$workspace_prompt" == *'# Bridge workspace contract'* ]] || fail "workspace contract missing"
++[[ "$workspace_prompt" == *'The operator explicitly exposed one caller project at /workspace in read-only mode.'* ]] || fail "workspace contract root missing"
++
++workspace_env="$HOME/fake-agy-env.txt"
++for secret_name in AGY_TOKEN AGY_SECRETS_DIR KEYRING_PASSWORD_FILE STATE_DIR AGY_WORKSPACE_HOST_PATH AGY_WORKSPACE_BRIDGE_CANARY; do
++  ! grep -q "^${secret_name}=" "$workspace_env" || fail "workspace child leaked $secret_name"
++done
++grep -q '^HOME=' "$workspace_env" || fail "workspace child missing HOME"
++grep -q '^PATH=' "$workspace_env" || fail "workspace child missing PATH"
++
++count_before="$(cat "$HOME/fake-agy-count.txt")"
++code="$(curl -sS -o "$work/rw-denied.json" -w '%{http_code}' \
++  -H 'content-type: application/json' \
++  -H "Authorization: Bearer $AGY_TOKEN" \
++  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"modify a file"}]}' \
++  http://127.0.0.1:17422/v1/chat/completions)"
++assert_eq "$code" 403
++count_after="$(cat "$HOME/fake-agy-count.txt")"
++assert_eq "$count_after" "$count_before"
++stop_bridge
+ 
+-echo "PASS: bridge auth, host guard, models, chat, stream, and autonomous routing"
++echo "PASS: bridge default regression and explicit read-only workspace runtime"
