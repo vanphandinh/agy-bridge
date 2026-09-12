@@ -1,0 +1,220 @@
+diff --git a/compose.workspace.yaml b/compose.workspace.yaml
+new file mode 100644
+index 0000000..8e8fcc1
+--- /dev/null
++++ b/compose.workspace.yaml
+@@ -0,0 +1,17 @@
++services:
++  agy-bridge:
++    environment:
++      AGY_WORKSPACE_ROOT: /workspace
++      AGY_WORKSPACE_MODE: ro
++      MAX_CONCURRENT: "1"
++    read_only: true
++    tmpfs:
++      - /tmp
++      - /home/agy/.cache
++    volumes:
++      - type: bind
++        source: ${AGY_WORKSPACE_HOST_PATH:?AGY_WORKSPACE_HOST_PATH must be set}
++        target: /workspace
++        read_only: true
++        bind:
++          create_host_path: false
+diff --git a/docker/start-bridge.sh b/docker/start-bridge.sh
+index 93fbd05..fec4253 100755
+--- a/docker/start-bridge.sh
++++ b/docker/start-bridge.sh
+@@ -5,6 +5,7 @@ set -euo pipefail
+ AGY_SECRETS_DIR="${AGY_SECRETS_DIR:-/home/agy/.local/share/agy-secrets}"
+ bridge_token_file="$AGY_SECRETS_DIR/bridge_token"
+ keyring_password_file="$AGY_SECRETS_DIR/keyring_password"
++verified_versions_file="/app/docker/workspace/verified-agy-versions.txt"
+ 
+ [[ -s "$bridge_token_file" ]] || { echo "missing bridge token" >&2; exit 70; }
+ [[ -s "$keyring_password_file" ]] || { echo "missing keyring password" >&2; exit 70; }
+@@ -17,6 +18,57 @@ AGY_TOKEN="$(cat "$bridge_token_file")"
+ export AGY_TOKEN
+ export KEYRING_PASSWORD_FILE="$keyring_password_file"
+ 
++workspace_enabled=false
++if [[ -n "${AGY_WORKSPACE_ROOT:-}" || -n "${AGY_WORKSPACE_MODE:-}" ]]; then
++  workspace_enabled=true
++  [[ "${AGY_WORKSPACE_ROOT:-}" == "/workspace" ]] || {
++    echo "workspace mode requires AGY_WORKSPACE_ROOT=/workspace" >&2
++    exit 65
++  }
++  [[ "${AGY_WORKSPACE_MODE:-}" == "ro" ]] || {
++    echo "workspace mode requires AGY_WORKSPACE_MODE=ro" >&2
++    exit 65
++  }
++  [[ "${MAX_CONCURRENT:-}" == "1" ]] || {
++    echo "workspace mode requires MAX_CONCURRENT=1" >&2
++    exit 65
++  }
++  [[ -d /workspace ]] || { echo "workspace mount target is missing" >&2; exit 65; }
++
++  mount_options="$(awk '$5 == "/workspace" { print $6; exit }' /proc/self/mountinfo)"
++  [[ -n "$mount_options" ]] || {
++    echo "workspace mode requires /workspace to be a distinct mount" >&2
++    exit 65
++  }
++  case ",$mount_options," in
++    *,ro,*) ;;
++    *) echo "workspace mount must be read-only" >&2; exit 65 ;;
++  esac
++
++  for collision in \
++    /workspace/.agents/agents/agy-bridge-worker-ro-v1.md \
++    /workspace/.agents/agents/agy-bridge-worker-ro-v1/agent.md; do
++    [[ ! -e "$collision" ]] || {
++      echo "workspace contains reserved agent collision: $collision" >&2
++      exit 65
++    }
++  done
++
++  [[ -f "$verified_versions_file" ]] || {
++    echo "workspace verified-version allowlist is missing" >&2
++    exit 65
++  }
++  agy_version="$($AGY_BIN --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)"
++  [[ -n "$agy_version" ]] || {
++    echo "could not determine exact agy semantic version" >&2
++    exit 65
++  }
++  grep -Fx -- "$agy_version" "$verified_versions_file" >/dev/null || {
++    echo "agy $agy_version is not verified for explicit host workspace mode" >&2
++    exit 65
++  }
++fi
++
+ agents_dir="$HOME/.gemini/config/agents"
+ mkdir -p "$agents_dir"
+ for profile in raw worker-ro worker-rw agy-bridge-worker-ro-v1; do
+@@ -27,6 +79,10 @@ for profile in raw worker-ro worker-rw agy-bridge-worker-ro-v1; do
+   cp "$src" "$dst_dir/agent.md"
+ done
+ 
++if [[ "$workspace_enabled" == true ]]; then
++  echo "workspace_enabled=true workspace_mode=ro workspace_root=/workspace"
++fi
++
+ exec /app/docker/keyring-session.sh bash -lc '
+   set -euo pipefail
+   if ! timeout 45s "$AGY_BIN" models >/tmp/agy-models.tsv 2>/tmp/agy-models.err; then
+diff --git a/docker/tests/check-runtime-permissions.sh b/docker/tests/check-runtime-permissions.sh
+index ade9e76..0cda5bf 100755
+--- a/docker/tests/check-runtime-permissions.sh
++++ b/docker/tests/check-runtime-permissions.sh
+@@ -18,3 +18,9 @@ if grep -F -- '--allow-read="$HOME/.gemini"' "$file" >/dev/null; then
+   echo 'broad ~/.gemini read is forbidden' >&2
+   exit 1
+ fi
++for forbidden in '--allow-read=/workspace' '--allow-write=/workspace'; do
++  if grep -F -- "$forbidden" "$file" >/dev/null; then
++    echo "workspace Deno filesystem permission is forbidden: $forbidden" >&2
++    exit 1
++  fi
++done
+diff --git a/docker/tests/fake-agy.sh b/docker/tests/fake-agy.sh
+index c0699d1..f812f57 100755
+--- a/docker/tests/fake-agy.sh
++++ b/docker/tests/fake-agy.sh
+@@ -5,6 +5,10 @@ if [[ "${1:-}" == "models" ]]; then
+   printf 'gemini-test-high\tGemini Test High\n'
+   exit 0
+ fi
++if [[ "${1:-}" == "--version" ]]; then
++  printf 'agy 9.9.9\n'
++  exit 0
++fi
+ home="${HOME:-/tmp}"
+ args_file="${FAKE_AGY_ARGS_FILE:-$home/fake-agy-args.txt}"
+ capture_file="${FAKE_AGY_CAPTURE_FILE:-$home/fake-agy-input.ndjson}"
+diff --git a/docker/tests/test-compose-workspace.ps1 b/docker/tests/test-compose-workspace.ps1
+new file mode 100644
+index 0000000..27046a0
+--- /dev/null
++++ b/docker/tests/test-compose-workspace.ps1
+@@ -0,0 +1,70 @@
++$ErrorActionPreference = 'Stop'
++Set-StrictMode -Version Latest
++
++$workspace = Join-Path ([System.IO.Path]::GetTempPath()) ("agy-bridge-workspace-" + [Guid]::NewGuid().ToString('N'))
++New-Item -ItemType Directory -Path $workspace | Out-Null
++$previous = $env:AGY_WORKSPACE_HOST_PATH
++
++try {
++  $env:AGY_WORKSPACE_HOST_PATH = $workspace
++  $json = docker compose -f compose.yaml -f compose.workspace.yaml config --format json
++  if ($LASTEXITCODE -ne 0) { throw 'workspace Compose config failed to resolve' }
++  $config = $json | ConvertFrom-Json
++  $bridge = $config.services.'agy-bridge'
++  if (-not $bridge) { throw 'agy-bridge service missing' }
++
++  $workspaceMounts = @($bridge.volumes | Where-Object { $_.target -eq '/workspace' })
++  if ($workspaceMounts.Count -ne 1) { throw "expected exactly one /workspace mount, got $($workspaceMounts.Count)" }
++  $mount = $workspaceMounts[0]
++  if ($mount.type -ne 'bind') { throw '/workspace must be a bind mount' }
++  if ($mount.read_only -ne $true) { throw '/workspace bind must be read-only' }
++  $createHostPath = $mount.bind.PSObject.Properties['create_host_path']
++  if ($null -eq $createHostPath -or $createHostPath.Value -ne $false) {
++    throw '/workspace bind.create_host_path must be false'
++  }
++
++  if ($bridge.environment.AGY_WORKSPACE_ROOT -ne '/workspace') { throw 'AGY_WORKSPACE_ROOT must be /workspace' }
++  if ($bridge.environment.AGY_WORKSPACE_MODE -ne 'ro') { throw 'AGY_WORKSPACE_MODE must be ro' }
++  if ([string]$bridge.environment.MAX_CONCURRENT -ne '1') { throw 'workspace MAX_CONCURRENT must be 1' }
++  if ($bridge.read_only -ne $true) { throw 'workspace root filesystem must be read-only' }
++
++  $tmpfsText = @($bridge.tmpfs) -join "`n"
++  if ($tmpfsText -notmatch '(^|\n)/tmp($|\n|:)') { throw 'workspace tmpfs must contain /tmp' }
++  if ($tmpfsText -notmatch '/home/agy/\.cache') { throw 'workspace tmpfs must contain /home/agy/.cache' }
++
++  $published = @($bridge.ports)
++  if ($published.Count -ne 1) { throw "expected one published port, got $($published.Count)" }
++  $port = $published[0]
++  if ($port.host_ip -ne '127.0.0.1' -or [int]$port.published -ne 7421 -or [int]$port.target -ne 7421) {
++    throw 'workspace deployment must publish only 127.0.0.1:7421 -> 7421'
++  }
++
++  $bridgeText = $bridge | ConvertTo-Json -Depth 20
++  if ($bridgeText -match '/var/run/docker\.sock') { throw 'Docker socket must not be mounted' }
++  $privileged = $bridge.PSObject.Properties['privileged']
++  if ($null -ne $privileged -and $privileged.Value -eq $true) { throw 'privileged mode must be disabled' }
++  $networkMode = $bridge.PSObject.Properties['network_mode']
++  if ($null -ne $networkMode -and [string]$networkMode.Value -eq 'host') { throw 'host network must not be used' }
++
++  foreach ($name in @('agy-auth', 'print-token', 'init-secrets', 'test')) {
++    $serviceProperty = $config.services.PSObject.Properties[$name]
++    if ($null -eq $serviceProperty) { continue }
++    $text = $serviceProperty.Value.volumes | ConvertTo-Json -Depth 10
++    if ($text -match '"target"\s*:\s*"/workspace"') {
++      throw "$name must not receive the /workspace mount"
++    }
++  }
++
++  foreach ($volumeName in @('agy-config', 'agy-keyring', 'agy-secrets', 'bridge-state')) {
++    if ($null -eq $config.volumes.PSObject.Properties[$volumeName]) {
++      throw "required named volume missing: $volumeName"
++    }
++  }
++
++  Write-Host 'PASS: explicit read-only workspace Compose boundary'
++}
++finally {
++  if ($null -eq $previous) { Remove-Item Env:AGY_WORKSPACE_HOST_PATH -ErrorAction SilentlyContinue }
++  else { $env:AGY_WORKSPACE_HOST_PATH = $previous }
++  Remove-Item -Recurse -Force $workspace -ErrorAction SilentlyContinue
++}
+diff --git a/docker/workspace/verified-agy-versions.txt b/docker/workspace/verified-agy-versions.txt
+new file mode 100644
+index 0000000..55d7ded
+--- /dev/null
++++ b/docker/workspace/verified-agy-versions.txt
+@@ -0,0 +1,5 @@
++# Exact official agy semantic versions that passed the full live read-only
++# workspace containment verifier on the final candidate PR SHA.
++#
++# Do not add a version based on unit/static tests alone. Workspace mode must
++# fail closed for every version not listed here.

@@ -1,0 +1,34 @@
+name: Temporary PR3 patch applier
+
+on:
+  push:
+    branches:
+      - tmp/pr3-apply-commit3
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[patch-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply audited patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check .pr3-commit3.patch
+          git apply .pr3-commit3.patch
+          git diff --check
+      - name: Commit patched tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add compose.workspace.yaml docker/start-bridge.sh docker/tests/check-runtime-permissions.sh docker/tests/fake-agy.sh docker/tests/test-compose-workspace.ps1 docker/workspace/verified-agy-versions.txt
+          git commit -m 'temp: apply PR3 commit3 patch [patch-applied]'
+          git push origin HEAD:tmp/pr3-apply-commit3
