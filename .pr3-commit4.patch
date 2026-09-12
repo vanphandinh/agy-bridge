@@ -1,0 +1,523 @@
+diff --git a/agy-bridge.ts b/agy-bridge.ts
+index 0b9fc43..0b1851b 100644
+--- a/agy-bridge.ts
++++ b/agy-bridge.ts
+@@ -80,6 +80,7 @@ function loadWorkspaceConfig(): WorkspaceConfig | null {
+ 
+ const WORKSPACE = loadWorkspaceConfig();
+ const WORKSPACE_AGENT = "agy-bridge-worker-ro-v1";
++const WORKSPACE_POLICY_HELPER = "/app/docker/workspace-policy.sh";
+ const WORKSPACE_CONTRACT = `# Bridge workspace contract
+ 
+ The operator explicitly exposed one caller project at /workspace in read-only mode.
+@@ -671,6 +672,26 @@ interface AgyExecutionContext {
+   workspaceReadOnly?: boolean;
+ }
+ 
++async function runWorkspacePolicy(action: "apply-ro" | "restore"): Promise<void> {
++  const child = new Deno.Command(WORKSPACE_POLICY_HELPER, {
++    args: [action],
++    stdout: "piped",
++    stderr: "piped",
++    stdin: "null",
++    env: childEnv(),
++    clearEnv: true,
++  }).spawn();
++  const [stdout, stderr, status] = await Promise.all([
++    new Response(child.stdout).text(),
++    new Response(child.stderr).text(),
++    child.status,
++  ]);
++  if (!status.success) {
++    const detail = stderr.trim() || stdout.trim() || `exit code ${status.code}`;
++    throw new Error(`${action} failed: ${detail}`);
++  }
++}
++
+ async function runAgy(
+   model: string,
+   prompt: string,
+@@ -687,8 +708,15 @@ async function runAgy(
+   let watchdog: ReturnType<typeof setTimeout> | null = null;
+   let onAbort: (() => void) | null = null;
+   let abortListenerAdded = false;
++  let workspacePolicyApplied = false;
++  let workspaceChildStatus: Promise<Deno.CommandStatus> | null = null;
++  let workspaceChildKill: (() => void) | null = null;
+ 
+   try {
++    if (execution.workspaceReadOnly) {
++      await runWorkspacePolicy("apply-ro");
++      workspacePolicyApplied = true;
++    }
+     const args = [
+       "--agent",
+       agent,
+@@ -717,6 +745,7 @@ async function runAgy(
+     // agy keeps stdin open but never reads it.
+     const stderrText = new Response(child.stderr).text().catch(() => "");
+     const statusPromise = child.status;
++    if (execution.workspaceReadOnly) workspaceChildStatus = statusPromise;
+     let exited = false;
+     let escalateTimer: ReturnType<typeof setTimeout> | null = null;
+     const clearEscalation = () => {
+@@ -734,9 +763,9 @@ async function runAgy(
+         child.kill("SIGTERM");
+       } catch { /* already dead */ }
+       if (escalateTimer === null) {
+-        // This timer intentionally survives runAgy's outer finally. A child
+-        // that ignores SIGTERM still needs SIGKILL after the request gate is
+-        // released; child.status owns cancellation when the process exits.
++        // Default runs may release their request gate before this escalation.
++        // Workspace runs wait for child.status before restoring policy and
++        // releasing the concurrency slot.
+         escalateTimer = setTimeout(() => {
+           if (!exited) {
+             try {
+@@ -746,6 +775,7 @@ async function runAgy(
+         }, 3_000);
+       }
+     };
++    if (execution.workspaceReadOnly) workspaceChildKill = killHard;
+ 
+     let resolveAbort: ((value: "aborted") => void) | null = null;
+     const abortPromise = signal
+@@ -910,6 +940,27 @@ async function runAgy(
+     if (signal && onAbort && abortListenerAdded) {
+       signal.removeEventListener("abort", onAbort);
+     }
++    if (workspacePolicyApplied && workspaceChildStatus) {
++      workspaceChildKill?.();
++      try {
++        await workspaceChildStatus;
++      } catch {
++        // The containment invariant needs terminal process state, not a
++        // successful exit code. runAgy records the actual request failure.
++      }
++    }
++    if (workspacePolicyApplied) {
++      try {
++        await runWorkspacePolicy("restore");
++      } catch (e) {
++        result.ok = false;
++        result.text = "";
++        result.error = `workspace policy restore failed: ${
++          e instanceof Error ? e.message : String(e)
++        }`;
++        console.error("workspace policy restore failed");
++      }
++    }
+     release();
+     const dur = (Date.now() - started) / 1000;
+     await appendUsage({
+diff --git a/Dockerfile b/Dockerfile
+index 98fc832..87e8edc 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -10,6 +10,7 @@ RUN apt-get update \
+       dbus \
+       dbus-x11 \
+       gnome-keyring \
++      jq \
+       libsecret-tools \
+       tini \
+  && rm -rf /var/lib/apt/lists/*
+diff --git a/docker/start-bridge.sh b/docker/start-bridge.sh
+index fec4253..fc57b25 100755
+--- a/docker/start-bridge.sh
++++ b/docker/start-bridge.sh
+@@ -3,6 +3,7 @@ set -euo pipefail
+ 
+ /app/docker/init-secrets.sh
+ AGY_SECRETS_DIR="${AGY_SECRETS_DIR:-/home/agy/.local/share/agy-secrets}"
++STATE_DIR="${STATE_DIR:-/home/agy/.local/state/agy-bridge}"
+ bridge_token_file="$AGY_SECRETS_DIR/bridge_token"
+ keyring_password_file="$AGY_SECRETS_DIR/keyring_password"
+ verified_versions_file="/app/docker/workspace/verified-agy-versions.txt"
+@@ -17,6 +18,11 @@ AGY_TOKEN="$(cat "$bridge_token_file")"
+ }
+ export AGY_TOKEN
+ export KEYRING_PASSWORD_FILE="$keyring_password_file"
++export STATE_DIR
++
++# Recover a transaction left behind by an abrupt prior workspace run. This is
++# also required when returning to the default no-workspace deployment.
++/app/docker/workspace-policy.sh restore-if-needed
+ 
+ workspace_enabled=false
+ if [[ -n "${AGY_WORKSPACE_ROOT:-}" || -n "${AGY_WORKSPACE_MODE:-}" ]]; then
+@@ -97,7 +103,7 @@ exec /app/docker/keyring-session.sh bash -lc '
+   exec deno run \
+     --allow-net=0.0.0.0:7421 \
+     --allow-env \
+-    --allow-run="$AGY_BIN" \
++    --allow-run="$AGY_BIN,/app/docker/workspace-policy.sh" \
+     --allow-read="$HOME/.gemini/antigravity-cli/brain" \
+     --allow-write="$STATE_DIR" \
+     /app/agy-bridge.ts
+diff --git a/docker/tests/fake-agy.sh b/docker/tests/fake-agy.sh
+index f812f57..d4849ba 100755
+--- a/docker/tests/fake-agy.sh
++++ b/docker/tests/fake-agy.sh
+@@ -26,6 +26,18 @@ count=0
+ # Drain it so the writer cannot hit EPIPE if the fake exits too early.
+ input="$(cat || true)"
+ printf '%s\n' "$input" > "$capture_file"
++
++if [[ "$input" == *'FAKE_CHILD_FAILURE'* ]]; then
++  printf '%s\n' '{"event":"result","result":{"status":"ERROR","error":"fake child failure","conversation_id":"fake-conversation"}}'
++  exit 1
++fi
++
++if [[ "$input" == *'FAKE_HANG'* ]]; then
++  trap '' TERM
++  sleep 30
++  exit 1
++fi
++
+ printf '%s\n' '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"fake reply"}}'
+ printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"fake reply","conversation_id":"fake-conversation","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}'
+diff --git a/docker/tests/test-bridge.sh b/docker/tests/test-bridge.sh
+index 282af8b..7cf6bb3 100755
+--- a/docker/tests/test-bridge.sh
++++ b/docker/tests/test-bridge.sh
+@@ -23,7 +23,7 @@ start_bridge() {
+   deno run \
+     --allow-net="127.0.0.1:$port" \
+     --allow-env \
+-    --allow-run="$AGY_BIN" \
++    --allow-run="$AGY_BIN,/app/docker/workspace-policy.sh" \
+     --allow-read="$HOME/.gemini/antigravity-cli/brain" \
+     --allow-write="$STATE_DIR" \
+     /app/agy-bridge.ts >"$work/bridge-$port.out" 2>"$work/bridge-$port.err" &
+@@ -108,7 +108,7 @@ assert_workspace_config_rejected() {
+     deno run \
+       --allow-net=127.0.0.1:17429 \
+       --allow-env \
+-      --allow-run="$AGY_BIN" \
++      --allow-run="$AGY_BIN,/app/docker/workspace-policy.sh" \
+       --allow-read="$HOME/.gemini/antigravity-cli/brain" \
+       --allow-write="$STATE_DIR" \
+       /app/agy-bridge.ts >"$work/reject-$name.out" 2>"$work/reject-$name.err"; then
+@@ -164,6 +164,39 @@ code="$(curl -sS -o "$work/rw-denied.json" -w '%{http_code}' \
+ assert_eq "$code" 403
+ count_after="$(cat "$HOME/fake-agy-count.txt")"
+ assert_eq "$count_after" "$count_before"
++[[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "workspace policy backup remained after successful request"
++
++# A child-side failure must still restore the policy transaction.
++code="$(curl -sS -o "$work/child-failure.json" -w '%{http_code}' \
++  -H 'content-type: application/json' \
++  -H "Authorization: Bearer $AGY_TOKEN" \
++  -d '{"model":"auto-ro-gemini-test","messages":[{"role":"user","content":"FAKE_CHILD_FAILURE"}]}' \
++  http://127.0.0.1:17422/v1/chat/completions)"
++assert_eq "$code" 502
++[[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "workspace policy backup remained after child failure"
++stop_bridge
++
++# A hard-deadline path uses a fake child that ignores SIGTERM. The bridge must
++# wait for terminal child status (SIGKILL escalation) before restoring policy.
++export PRINT_TIMEOUT=1ms
++export AGY_HARD_MARGIN_MS=50
++start_bridge 17423
++code="$(curl -sS -o "$work/hard-deadline.json" -w '%{http_code}' \
++  -H 'content-type: application/json' \
++  -H "Authorization: Bearer $AGY_TOKEN" \
++  -d '{"model":"auto-ro-gemini-test","messages":[{"role":"user","content":"FAKE_HANG"}]}' \
++  http://127.0.0.1:17423/v1/chat/completions)"
++assert_eq "$code" 502
++[[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "workspace policy backup remained after hard deadline"
++stop_bridge
++unset PRINT_TIMEOUT AGY_HARD_MARGIN_MS
++
+ stop_bridge
+ 
+ echo "PASS: bridge default regression and explicit read-only workspace runtime"
+diff --git a/docker/tests/run.sh b/docker/tests/run.sh
+index f592192..a31f256 100755
+--- a/docker/tests/run.sh
++++ b/docker/tests/run.sh
+@@ -3,8 +3,10 @@ set -euo pipefail
+ bash -n /app/docker/*.sh /app/docker/tests/*.sh
+ bash /app/docker/tests/test-secrets.sh
+ bash /app/docker/tests/test-keyring.sh
++bash /app/docker/tests/test-workspace-policy.sh /app/docker/workspace-policy.sh
+ bash /app/docker/tests/check-runtime-permissions.sh /app/docker/start-bridge.sh
+ bash /app/docker/tests/check-runagy-lifecycle.sh /app/agy-bridge.ts
++bash /app/docker/tests/check-workspace-runagy-lifecycle.sh /app/agy-bridge.ts
+ bash /app/docker/tests/check-verify-all-policy.sh /app/docker/tests/verify-all.ps1
+ deno fmt --check /app/tests/runagy-blocked-stdin.test.ts /app/tests/service.test.ts
+ bash /app/docker/tests/test-bridge.sh
+diff --git a/docker/tests/check-runtime-permissions.sh b/docker/tests/check-runtime-permissions.sh
+index 0cda5bf..a63d4bd 100755
+--- a/docker/tests/check-runtime-permissions.sh
++++ b/docker/tests/check-runtime-permissions.sh
+@@ -10,6 +10,10 @@ grep -F -- '--allow-read="$HOME/.gemini/antigravity-cli/brain"' "$file" >/dev/nu
+   echo 'missing scoped transcript read permission' >&2
+   exit 1
+ }
++grep -F -- '/app/docker/workspace-policy.sh' "$file" >/dev/null || {
++  echo 'missing exact workspace policy helper run permission' >&2
++  exit 1
++}
+ if grep -E -- '^[[:space:]]*--allow-net[[:space:]]*\\?$' "$file" >/dev/null; then
+   echo 'bare --allow-net is forbidden' >&2
+   exit 1
+ fi
+diff --git a/docker/workspace-policy.sh b/docker/workspace-policy.sh
+new file mode 100755
+index 0000000..9e6e644
+--- /dev/null
++++ b/docker/workspace-policy.sh
+@@ -0,0 +1,135 @@
++#!/usr/bin/env bash
++set -euo pipefail
++umask 077
++
++action="${1:-}"
++settings_file="$HOME/.gemini/antigravity-cli/settings.json"
++backup_file="$STATE_DIR/workspace-policy-backup.json"
++settings_dir="$(dirname "$settings_file")"
++backup_dir="$(dirname "$backup_file")"
++managed_keys='["allowNonWorkspaceAccess","trustedWorkspaces","toolPermission","permissions"]'
++
++fail() {
++  echo "workspace policy: $*" >&2
++  exit 1
++}
++
++read_settings() {
++  if [[ -f "$settings_file" ]]; then
++    jq -e 'type == "object"' "$settings_file" >/dev/null 2>&1 || fail "settings.json is not a valid JSON object"
++    cat "$settings_file"
++  else
++    printf '{}\n'
++  fi
++}
++
++atomic_json_write() {
++  local target="$1" input="$2" dir tmp
++  dir="$(dirname "$target")"
++  mkdir -p "$dir"
++  tmp="$(mktemp "$dir/.workspace-policy.XXXXXX")"
++  trap 'rm -f "${tmp:-}"' RETURN
++  printf '%s\n' "$input" > "$tmp"
++  jq -e . "$tmp" >/dev/null 2>&1 || fail "refusing to write invalid JSON"
++  mv -f "$tmp" "$target"
++  trap - RETURN
++}
++
++apply_ro() {
++  [[ ! -e "$backup_file" ]] || fail "backup already exists; refusing nested policy transaction"
++  mkdir -p "$settings_dir" "$backup_dir"
++
++  local settings backup updated settings_present
++  settings="$(read_settings)"
++  if [[ -f "$settings_file" ]]; then settings_present=true; else settings_present=false; fi
++
++  backup="$(jq -cn \
++    --argjson settings "$settings" \
++    --argjson keys "$managed_keys" \
++    --argjson settings_present "$settings_present" '
++      {
++        version: 1,
++        settingsFilePresent: $settings_present,
++        managed: (reduce $keys[] as $k ({};
++          .[$k] = {
++            present: ($settings | has($k)),
++            value: (if ($settings | has($k)) then $settings[$k] else null end)
++          }
++        ))
++      }
++    ')"
++  atomic_json_write "$backup_file" "$backup"
++
++  updated="$(jq '
++    .allowNonWorkspaceAccess = false
++    | .trustedWorkspaces = ["/workspace"]
++    | .toolPermission = "strict"
++    | .permissions = {
++        allow: ["read_file(/workspace)"],
++        deny: [
++          "read_file(/app)",
++          "write_file(/app)",
++          "read_file(/home/agy/.gemini)",
++          "write_file(/home/agy/.gemini)",
++          "read_file(/home/agy/.local/share/agy-secrets)",
++          "write_file(/home/agy/.local/share/agy-secrets)",
++          "read_file(/home/agy/.local/share/keyrings)",
++          "write_file(/home/agy/.local/share/keyrings)",
++          "read_file(/home/agy/.local/state/agy-bridge)",
++          "write_file(/home/agy/.local/state/agy-bridge)"
++        ]
++      }
++  ' <<<"$settings")"
++  atomic_json_write "$settings_file" "$updated"
++}
++
++restore_policy() {
++  [[ -f "$backup_file" ]] || fail "backup missing"
++  jq -e \
++    --argjson keys "$managed_keys" '
++      . as $backup
++      | .version == 1
++        and (.settingsFilePresent | type == "boolean")
++        and (.managed | type == "object")
++        and all($keys[]; . as $k |
++          ($backup.managed | has($k))
++          and ($backup.managed[$k].present | type == "boolean")
++          and ($backup.managed[$k] | has("value"))
++        )
++    ' "$backup_file" >/dev/null 2>&1 || fail "backup is corrupt; leaving it in place"
++
++  local settings restored
++  settings="$(read_settings)"
++  restored="$(jq \
++    --slurpfile backup "$backup_file" \
++    --argjson keys "$managed_keys" '
++      reduce $keys[] as $k (.;
++        if $backup[0].managed[$k].present
++        then .[$k] = $backup[0].managed[$k].value
++        else del(.[$k])
++        end
++      )
++    ' <<<"$settings")"
++  atomic_json_write "$settings_file" "$restored"
++
++  if [[ "$(jq -r '.settingsFilePresent' "$backup_file")" == "false" ]] && \
++     jq -e 'keys | length == 0' "$settings_file" >/dev/null 2>&1; then
++    rm -f "$settings_file"
++  fi
++  rm -f "$backup_file"
++}
++
++case "$action" in
++  apply-ro)
++    apply_ro
++    ;;
++  restore)
++    restore_policy
++    ;;
++  restore-if-needed)
++    if [[ -e "$backup_file" ]]; then restore_policy; fi
++    ;;
++  *)
++    fail "usage: $0 {apply-ro|restore|restore-if-needed}"
++    ;;
++esac
+diff --git a/docker/tests/test-workspace-policy.sh b/docker/tests/test-workspace-policy.sh
+new file mode 100755
+index 0000000..ce8060b
+--- /dev/null
++++ b/docker/tests/test-workspace-policy.sh
+@@ -0,0 +1,81 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++helper="${1:-$script_dir/../workspace-policy.sh}"
++work="$(mktemp -d)"
++trap 'rm -rf "$work"' EXIT
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++assert_json_eq() {
++  local actual="$1" expected="$2" message="$3"
++  diff -u <(jq -S . "$expected") <(jq -S . "$actual") >/dev/null || fail "$message"
++}
++
++run_case() {
++  local name="$1" initial="$2"
++  local home="$work/$name/home" state="$work/$name/state"
++  mkdir -p "$home/.gemini/antigravity-cli" "$state"
++  export HOME="$home" STATE_DIR="$state"
++  local settings="$HOME/.gemini/antigravity-cli/settings.json"
++  if [[ "$initial" != '__ABSENT__' ]]; then
++    printf '%s\n' "$initial" > "$settings"
++  fi
++
++  local before="$work/$name-before.json"
++  if [[ -f "$settings" ]]; then cp "$settings" "$before"; else printf '{}\n' > "$before"; fi
++
++  "$helper" apply-ro
++  [[ -f "$STATE_DIR/workspace-policy-backup.json" ]] || fail "$name: backup missing"
++  jq -e '
++    .allowNonWorkspaceAccess == false and
++    .trustedWorkspaces == ["/workspace"] and
++    .toolPermission == "strict" and
++    .permissions.allow == ["read_file(/workspace)"] and
++    (.permissions.deny | index("read_file(/app)")) != null and
++    (.permissions.deny | index("write_file(/home/agy/.local/state/agy-bridge)")) != null
++  ' "$settings" >/dev/null || fail "$name: RO policy mismatch"
++  if grep -Eq 'read_file\(\*\)|write_file\(\*\)|command\(\*\)' "$settings"; then
++    fail "$name: wildcard permission present"
++  fi
++
++  if "$helper" apply-ro >/dev/null 2>&1; then
++    fail "$name: second apply unexpectedly succeeded"
++  fi
++
++  "$helper" restore
++  [[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "$name: backup not removed after restore"
++
++  if [[ "$initial" == '__ABSENT__' ]]; then
++    if [[ -f "$settings" ]]; then
++      jq -e 'keys | length == 0' "$settings" >/dev/null || fail "$name: absent settings restored with content"
++    fi
++  else
++    assert_json_eq "$settings" "$before" "$name: settings not restored exactly"
++  fi
++}
++
++run_case absent '__ABSENT__'
++run_case present '{"allowNonWorkspaceAccess":true,"trustedWorkspaces":["/old"],"toolPermission":"permissive","permissions":{"allow":["legacy"]},"unrelated":{"keep":1}}'
++run_case mixed '{"trustedWorkspaces":["/elsewhere"],"permissions":{"deny":["legacy-deny"]},"unrelated":"keep"}'
++
++# Stale-backup recovery: apply, then a new invocation restores it.
++export HOME="$work/stale/home" STATE_DIR="$work/stale/state"
++mkdir -p "$HOME/.gemini/antigravity-cli" "$STATE_DIR"
++printf '%s\n' '{"unrelated":42,"toolPermission":"old"}' > "$HOME/.gemini/antigravity-cli/settings.json"
++cp "$HOME/.gemini/antigravity-cli/settings.json" "$work/stale-before.json"
++"$helper" apply-ro
++"$helper" restore-if-needed
++assert_json_eq "$HOME/.gemini/antigravity-cli/settings.json" "$work/stale-before.json" 'stale recovery mismatch'
++
++# Corrupt backup fails closed and stays for inspection.
++export HOME="$work/corrupt/home" STATE_DIR="$work/corrupt/state"
++mkdir -p "$HOME/.gemini/antigravity-cli" "$STATE_DIR"
++printf '%s\n' '{}' > "$HOME/.gemini/antigravity-cli/settings.json"
++printf '%s\n' '{broken' > "$STATE_DIR/workspace-policy-backup.json"
++if "$helper" restore-if-needed >/dev/null 2>&1; then
++  fail 'corrupt backup unexpectedly restored'
++fi
++[[ -f "$STATE_DIR/workspace-policy-backup.json" ]] || fail 'corrupt backup should remain'
++
++echo 'PASS: transactional workspace policy helper'
+diff --git a/docker/tests/check-workspace-runagy-lifecycle.sh b/docker/tests/check-workspace-runagy-lifecycle.sh
+new file mode 100755
+index 0000000..70cc897
+--- /dev/null
++++ b/docker/tests/check-workspace-runagy-lifecycle.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++set -euo pipefail
++file="${1:-/app/agy-bridge.ts}"
++
++apply_line="$(grep -nF 'await runWorkspacePolicy("apply-ro")' "$file" | head -1 | cut -d: -f1)"
++spawn_line="$(grep -nF 'const child = new Deno.Command(AGY_BIN' "$file" | head -1 | cut -d: -f1)"
++status_wait_line="$(grep -nF 'await workspaceChildStatus;' "$file" | head -1 | cut -d: -f1)"
++restore_line="$(grep -nF 'await runWorkspacePolicy("restore")' "$file" | head -1 | cut -d: -f1)"
++release_line="$(grep -nF 'release();' "$file" | tail -1 | cut -d: -f1)"
++
++for pair in \
++  "$apply_line:$spawn_line:policy apply must happen before agy spawn" \
++  "$spawn_line:$status_wait_line:workspace child terminal wait must happen after spawn" \
++  "$status_wait_line:$restore_line:workspace policy restore must wait for child terminal status" \
++  "$restore_line:$release_line:workspace policy restore must happen before concurrency release"; do
++  IFS=: read -r first second message <<<"$pair"
++  if [[ -z "$first" || -z "$second" || "$first" -ge "$second" ]]; then
++    echo "$message" >&2
++    exit 1
++  fi
++done
++
++echo 'PASS: workspace runAgy policy lifecycle ordering'

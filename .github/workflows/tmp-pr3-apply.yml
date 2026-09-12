@@ -1,0 +1,42 @@
+name: Temporary PR3 patch applier
+
+on:
+  push:
+    branches:
+      - tmp/pr3-apply-commit4
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[patch-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply audited patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check .pr3-commit4.patch
+          git apply .pr3-commit4.patch
+          git diff --check
+      - name: Run portable commit4 checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n docker/workspace-policy.sh docker/tests/test-workspace-policy.sh docker/tests/check-workspace-runagy-lifecycle.sh docker/tests/fake-agy.sh docker/tests/test-bridge.sh docker/start-bridge.sh
+          bash docker/tests/test-workspace-policy.sh docker/workspace-policy.sh
+          bash docker/tests/check-workspace-runagy-lifecycle.sh agy-bridge.ts
+          bash docker/tests/check-runtime-permissions.sh docker/start-bridge.sh
+      - name: Commit patched tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Dockerfile agy-bridge.ts docker/start-bridge.sh docker/workspace-policy.sh docker/tests/fake-agy.sh docker/tests/test-bridge.sh docker/tests/test-workspace-policy.sh docker/tests/check-workspace-runagy-lifecycle.sh docker/tests/check-runtime-permissions.sh docker/tests/run.sh
+          git commit -m 'temp: apply PR3 commit4 patch [patch-applied]'
+          git push origin HEAD:tmp/pr3-apply-commit4
