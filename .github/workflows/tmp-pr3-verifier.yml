@@ -1,0 +1,50 @@
+name: Temporary PR3 verifier transformer
+
+on:
+  push:
+    branches:
+      - tmp/pr3-apply-verifier
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[transform-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply verifier transformation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .pr3-apply-verifier.py
+          git diff --check
+      - name: Verify PowerShell parse and policy lock
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [void][scriptblock]::Create((Get-Content -Raw docker/tests/verify-all.ps1))
+          [void][scriptblock]::Create((Get-Content -Raw docker/tests/test-compose-workspace.ps1))
+      - name: Verify static verifier policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash docker/tests/check-verify-all-policy.sh docker/tests/verify-all.ps1
+          bash docker/tests/check-runtime-permissions.sh docker/start-bridge.sh
+      - name: Verify workspace Compose resolution
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./docker/tests/test-compose-workspace.ps1
+      - name: Commit transformed verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docker/tests/verify-all.ps1 docker/tests/check-verify-all-policy.sh
+          git commit -m 'temp: apply PR3 verifier transform [transform-applied]'
+          git push origin HEAD:tmp/pr3-apply-verifier
