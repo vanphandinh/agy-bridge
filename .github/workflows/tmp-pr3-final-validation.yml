@@ -1,0 +1,49 @@
+name: Temporary PR3 final validation
+
+on:
+  push:
+    branches:
+      - tmp/pr3-final-validation
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.6
+      - name: Diff and TypeScript gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff origin/main...HEAD --check
+          deno fmt --check
+          deno lint
+          deno task test
+      - name: PowerShell Compose and verifier parse gates
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [void][scriptblock]::Create((Get-Content -Raw docker/tests/verify-all.ps1))
+          ./docker/tests/test-compose.ps1
+          ./docker/tests/test-compose-workspace.ps1
+      - name: Static security policy gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash docker/tests/check-runtime-permissions.sh docker/start-bridge.sh
+          bash docker/tests/check-runagy-lifecycle.sh agy-bridge.ts
+          bash docker/tests/check-workspace-runagy-lifecycle.sh agy-bridge.ts
+          bash docker/tests/check-verify-all-policy.sh docker/tests/verify-all.ps1
+          bash docker/tests/test-workspace-policy.sh docker/workspace-policy.sh
+      - name: Deterministic Docker suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose --profile test run --rm test
