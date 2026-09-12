@@ -1,0 +1,40 @@
+name: Temporary PR3 docs transformer
+
+on:
+  push:
+    branches:
+      - tmp/pr3-apply-docs
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[transform-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply docs transformation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .pr3-apply-docs.py
+          git diff --check
+      - name: Verify documented Compose commands resolve
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./docker/tests/test-compose-workspace.ps1
+          docker compose config | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'default Compose config failed' }
+      - name: Commit transformed docs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/docker-compose.md
+          git commit -m 'temp: apply PR3 docs transform [transform-applied]'
+          git push origin HEAD:tmp/pr3-apply-docs
