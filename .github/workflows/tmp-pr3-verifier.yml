@@ -21,6 +21,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 .pr3-apply-verifier.py
+          python3 .pr3-fix-compose-test.py
           git diff --check
       - name: Verify PowerShell parse and policy lock
         shell: pwsh
@@ -45,6 +46,6 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add docker/tests/verify-all.ps1 docker/tests/check-verify-all-policy.sh
+          git add docker/tests/verify-all.ps1 docker/tests/check-verify-all-policy.sh docker/tests/test-compose-workspace.ps1
           git commit -m 'temp: apply PR3 verifier transform [transform-applied]'
           git push origin HEAD:tmp/pr3-apply-verifier
