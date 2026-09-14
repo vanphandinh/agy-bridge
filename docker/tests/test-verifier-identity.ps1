@@ -98,6 +98,16 @@ function Assert-Fail {
 }
 
 $repoRoot = Invoke-Git -ArgumentList @('rev-parse', '--show-toplevel')
+$workflowFile = Join-Path $repoRoot '.github/workflows/linux-docker-deterministic.yml'
+$workflowText = Get-Content -Raw $workflowFile
+if ($workflowText -notmatch "(?m)^\s+FROZEN_BASE_REF:\s+$expectedBase\s*$") {
+  throw "Linux deterministic workflow frozen base is not PR4 base $expectedBase"
+}
+if ($workflowText -notmatch '(?m)^\s+- "impl/pr4-read-write-host-workspace"\s*$') {
+  throw 'Linux deterministic workflow does not trigger pushes for the PR4 branch'
+}
+Write-Host 'PASS: PR4 Linux deterministic workflow identity wiring'
+
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "agy-pr3-identity-$PID-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 $allowedWorktree = Join-Path $tempRoot 'allowed'
 $nonAncestorWorktree = Join-Path $tempRoot 'non-ancestor'
@@ -116,15 +126,16 @@ try {
   Set-Content -NoNewline -Path (Join-Path $allowedWorktree 'docs/docker-compose.md') -Value 'allowed docs change'
   Set-Content -NoNewline -Path (Join-Path $allowedWorktree 'compose.workspace-rw.yaml') -Value 'services: {}'
   Set-Content -NoNewline -Path (Join-Path $allowedWorktree 'agents/agy-bridge-worker-rw-v1/agent.md') -Value 'allowed RW agent fixture'
-  Invoke-Git -WorkingDirectory $allowedWorktree -ArgumentList @('add', 'docker/tests/identity-allowed.txt', 'docs/docker-compose.md', 'compose.workspace-rw.yaml', 'agents/agy-bridge-worker-rw-v1/agent.md') | Out-Null
+  Set-Content -NoNewline -Path (Join-Path $allowedWorktree '.github/workflows/linux-docker-deterministic.yml') -Value 'name: allowed PR4 workflow fixture'
+  Invoke-Git -WorkingDirectory $allowedWorktree -ArgumentList @('add', 'docker/tests/identity-allowed.txt', 'docs/docker-compose.md', 'compose.workspace-rw.yaml', 'agents/agy-bridge-worker-rw-v1/agent.md', '.github/workflows/linux-docker-deterministic.yml') | Out-Null
   Invoke-Git -WorkingDirectory $allowedWorktree -ArgumentList @(
-    '-c', 'user.name=PR3 Identity Test',
-    '-c', 'user.email=pr3-identity-test@example.invalid',
-    'commit', '-m', 'test: allowed PR3 identity fixture'
+    '-c', 'user.name=PR4 Identity Test',
+    '-c', 'user.email=pr4-identity-test@example.invalid',
+    'commit', '-m', 'test: allowed PR4 identity fixture'
   ) | Out-Null
 
-  # allowed PR4 verifier/docs/runtime diff
-  Assert-Pass -Name 'allowed PR4 verifier/docs/runtime diff' -Result (Invoke-Identity -WorkingDirectory $allowedWorktree -BaseRef $expectedBase)
+  # allowed PR4 verifier/docs/runtime/workflow diff
+  Assert-Pass -Name 'allowed PR4 verifier/docs/runtime/workflow diff' -Result (Invoke-Identity -WorkingDirectory $allowedWorktree -BaseRef $expectedBase)
 
   $untrackedCanary = Join-Path $allowedWorktree "LOCAL-ONLY-UNTRACKED-$([Guid]::NewGuid().ToString('N')).txt"
   Set-Content -NoNewline -Path $untrackedCanary -Value 'arbitrary local-only file'
@@ -144,12 +155,12 @@ try {
 
   Invoke-Git -WorkingDirectory $repoRoot -ArgumentList @('worktree', 'add', '--detach', $disallowedWorktree, $expectedBase) | Out-Null
   $worktrees += $disallowedWorktree
-  Set-Content -NoNewline -Path (Join-Path $disallowedWorktree 'BLOCKER3-DISALLOWED.txt') -Value 'disallowed PR3 path'
+  Set-Content -NoNewline -Path (Join-Path $disallowedWorktree 'BLOCKER3-DISALLOWED.txt') -Value 'disallowed PR4 path'
   Invoke-Git -WorkingDirectory $disallowedWorktree -ArgumentList @('add', 'BLOCKER3-DISALLOWED.txt') | Out-Null
   Invoke-Git -WorkingDirectory $disallowedWorktree -ArgumentList @(
-    '-c', 'user.name=PR3 Identity Test',
-    '-c', 'user.email=pr3-identity-test@example.invalid',
-    'commit', '-m', 'test: disallowed PR3 identity fixture'
+    '-c', 'user.name=PR4 Identity Test',
+    '-c', 'user.email=pr4-identity-test@example.invalid',
+    'commit', '-m', 'test: disallowed PR4 identity fixture'
   ) | Out-Null
 
   # disallowed changed path
