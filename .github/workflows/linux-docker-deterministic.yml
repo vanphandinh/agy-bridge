@@ -113,11 +113,44 @@ jobs:
             -ExpectedHead $env:EXPECTED_HEAD `
             -BaseRef $env:BASE_REF
 
-      - name: Apply PR9 finding 4 staged patch
+      - name: Apply PR9 finding 4 RED patch
         shell: bash
         run: |
           set -euo pipefail
-          cp docker/tests/pr9-finding4.patch /tmp/pr9-finding4.patch
+          cat > /tmp/pr9-finding4.patch <<'PATCH'
+          diff --git a/docker/tests/fake-agy.sh b/docker/tests/fake-agy.sh
+          --- a/docker/tests/fake-agy.sh
+          +++ b/docker/tests/fake-agy.sh
+          @@ -30,6 +30,10 @@ input="$(cat || true)"
+           printf '%s\n' "$input" > "$capture_file"
+           
+          +if [[ "$input" == *'FAKE_TOOL_STEP'* ]]; then
+          +  printf '%s\n' '{"event":"step_update","step_update":{"step_type":"tool","text_delta":"fake tool activity"}}'
+          +fi
+          +
+           if [[ "$input" == *'FAKE_CREATE_RW_AGENT_COLLISION'* ]]; then
+             mkdir -p /workspace/.agents/agents/agy-bridge-worker-rw-v1
+             printf '%s\n' 'shadow' > /workspace/.agents/agents/agy-bridge-worker-rw-v1/agent.md
+          diff --git a/docker/tests/test-bridge.sh b/docker/tests/test-bridge.sh
+          --- a/docker/tests/test-bridge.sh
+          +++ b/docker/tests/test-bridge.sh
+          @@ -414,10 +414,17 @@ workspace_rw="$(curl -fsS \
+             -H 'content-type: application/json' \
+             -H "Authorization: Bearer $AGY_TOKEN" \
+          -  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"Modify the caller project."}]}' \
+          +  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"FAKE_TOOL_STEP Modify the caller project."}]}' \
+             http://127.0.0.1:17424/v1/chat/completions)"
+           [[ "$workspace_rw" == *'fake reply'* ]] || fail "RW deployment auto-rw reply missing"
+          +latest_usage="$(tail -n 1 "$STATE_DIR/usage.jsonl")"
+          +jq -e '
+          +  .autonomous == "rw" and
+          +  .agent == "agy-bridge-worker-rw-v1" and
+          +  .tool_step_updates == 1
+          +' <<<"$latest_usage" >/dev/null || fail "RW native tool-step evidence missing from usage log"
+           rw_args="$(cat "$HOME/fake-agy-args.txt")"
+           [[ "$rw_args" == *'--agent agy-bridge-worker-rw-v1'* ]] || fail "RW deployment auto-rw did not use reserved RW agent"
+           assert_eq "$(cat "$HOME/fake-agy-cwd.txt")" /workspace
+          PATCH
           git reset --hard 497ef9a08939835a060e0fe58ebb6f428e9a5dda
           git apply --check /tmp/pr9-finding4.patch
           git apply /tmp/pr9-finding4.patch
