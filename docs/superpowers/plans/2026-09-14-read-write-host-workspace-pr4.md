@@ -1351,3 +1351,16 @@ serious defect.
   regressions and require PASS.
 - [ ] Re-run the canonical deterministic suite and exact-SHA verifier, then
   repeat the independent security review on the integrated remote head.
+
+### Audit loop 3: centralized startup validation contract
+
+- [x] Reproduce the exact-SHA verifier failure after collision validation was
+  centralized in `workspace-policy.sh`.
+- [x] Confirm startup still fails closed for the intended reserved-agent
+  collision; only the Compose regression expected the pre-centralization error
+  wording from `start-bridge.sh`.
+- [x] Update the RW collision and dangling-collision assertions to match the
+  helper's stable semantic error (`reserved workspace agent collision`) without
+  reintroducing duplicated production validation.
+- [ ] Run the focused RW Compose boundary, deterministic suite, and exact-SHA
+  verifier before the next audit pass.
