@@ -51,6 +51,84 @@ function Assert-StartupRejected {
   }
 }
 
+function Assert-ManagedAgentDestinationSymlinkRejected {
+  param(
+    [Parameter(Mandatory = $true)][string]$Workspace,
+    [Parameter(Mandatory = $true)][ValidateSet('config', 'agents', 'profile', 'agent-file')][string]$SymlinkKind
+  )
+
+  $workspaceDockerPath = $Workspace -replace '\\', '/'
+  $targetDir = Join-Path $Workspace ("managed-agent-symlink-target-" + $SymlinkKind)
+  New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+  $targetDockerPath = "/workspace/managed-agent-symlink-target-$SymlinkKind"
+  $allowlist = Join-Path $Workspace ("rw-test-allowlist-$SymlinkKind.txt")
+  Set-Content -LiteralPath $allowlist -Value '2.9.6' -NoNewline
+  $allowlistDockerPath = $allowlist -replace '\\', '/'
+  $bootstrap = @"
+set -euo pipefail
+mkdir -p /home/agy/.gemini
+case '$SymlinkKind' in
+  config)
+    ln -s '$targetDockerPath' /home/agy/.gemini/config
+    ;;
+  agents)
+    mkdir -p /home/agy/.gemini/config
+    ln -s '$targetDockerPath' /home/agy/.gemini/config/agents
+    ;;
+  profile)
+    mkdir -p /home/agy/.gemini/config/agents
+    ln -s '$targetDockerPath' /home/agy/.gemini/config/agents/agy-bridge-worker-rw-v1
+    ;;
+  agent-file)
+    mkdir -p /home/agy/.gemini/config/agents/agy-bridge-worker-rw-v1
+    : > '$targetDockerPath/agent.md'
+    ln -s '$targetDockerPath/agent.md' /home/agy/.gemini/config/agents/agy-bridge-worker-rw-v1/agent.md
+    ;;
+esac
+exec /app/docker/start-bridge.sh
+"@
+
+  $previousErrorAction = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $output = (& docker run --rm --read-only `
+      --tmpfs '/tmp:rw' `
+      --tmpfs '/home/agy/.cache:rw,uid=10001,gid=10001,mode=0700' `
+      --tmpfs '/home/agy/.gemini:rw,uid=10001,gid=10001,mode=0700' `
+      --tmpfs '/home/agy/.local/share/agy-secrets:rw,uid=10001,gid=10001,mode=0700' `
+      --tmpfs '/home/agy/.local/share/keyrings:rw,uid=10001,gid=10001,mode=0700' `
+      --tmpfs '/home/agy/.local/state/agy-bridge:rw,uid=10001,gid=10001,mode=0700' `
+      --mount "type=bind,src=$workspaceDockerPath,dst=/workspace" `
+      --mount "type=bind,src=$allowlistDockerPath,dst=/app/docker/workspace/verified-rw-agy-versions.txt,readonly" `
+      -e 'AGY_WORKSPACE_ROOT=/workspace' `
+      -e 'AGY_WORKSPACE_MODE=rw' `
+      -e 'MAX_CONCURRENT=1' `
+      -e 'AGY_BIN=deno' `
+      agy-bridge:local bash -lc $bootstrap 2>&1 | Out-String)
+    $exitCode = $LASTEXITCODE
+  }
+  finally {
+    $ErrorActionPreference = $previousErrorAction
+  }
+
+  if ($exitCode -eq 0) { throw "$SymlinkKind managed-agent destination unexpectedly started successfully" }
+  if ($SymlinkKind -eq 'agent-file') {
+    $targetFile = Join-Path $targetDir 'agent.md'
+    if ((Get-Item -LiteralPath $targetFile).Length -ne 0) {
+      throw 'agent-file managed-agent destination overwrote a workspace file through a persisted symlink'
+    }
+  }
+  else {
+    $written = Get-ChildItem -LiteralPath $targetDir -Force -ErrorAction SilentlyContinue
+    if (@($written).Count -ne 0) {
+      throw "$SymlinkKind managed-agent destination wrote through a persisted symlink into /workspace"
+    }
+  }
+  if ($output -notmatch 'managed agent destination must not be a symlink') {
+    throw "$SymlinkKind managed-agent destination failed for the wrong reason. Output:`n$output"
+  }
+}
+
 $workspace = Join-Path ([System.IO.Path]::GetTempPath()) ("agy-bridge-workspace-rw-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $workspace | Out-Null
 $previous = $env:AGY_WORKSPACE_HOST_PATH
@@ -168,6 +246,10 @@ try {
   Assert-StartupRejected -Name 'rw-version-not-verified' -Workspace $workspace -Root '/workspace' -Mode 'rw' -MaxConcurrent '1' -WorkspaceMount 'rw' -AgyBin 'deno' -Expected 'agy 2.9.6 is not verified for explicit read-write host workspace mode'
   Assert-StartupRejected -Name 'ro-mounted-rw' -Workspace $workspace -Root '/workspace' -Mode 'ro' -MaxConcurrent '1' -WorkspaceMount 'rw' -Expected 'read-only workspace mount must be read-only'
   Assert-StartupRejected -Name 'ro-version-allowlist' -Workspace $workspace -Root '/workspace' -Mode 'ro' -MaxConcurrent '1' -WorkspaceMount 'ro' -AgyBin 'deno' -Expected 'agy 2.9.6 is not verified for explicit read-only host workspace mode'
+
+  foreach ($symlinkKind in @('config', 'agents', 'profile', 'agent-file')) {
+    Assert-ManagedAgentDestinationSymlinkRejected -Workspace $workspace -SymlinkKind $symlinkKind
+  }
 
   Write-Host 'PASS: explicit read-write workspace Compose boundary'
 }

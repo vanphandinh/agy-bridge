@@ -87,14 +87,32 @@ if [[ -n "${AGY_WORKSPACE_ROOT:-}" || -n "${AGY_WORKSPACE_MODE:-}" ]]; then
   }
 fi
 
-agents_dir="$HOME/.gemini/config/agents"
+managed_config_dir="$HOME/.gemini/config"
+agents_dir="$managed_config_dir/agents"
+for managed_dir in "$managed_config_dir" "$agents_dir"; do
+  [[ ! -L "$managed_dir" ]] || {
+    echo "managed agent destination must not be a symlink: $managed_dir" >&2
+    exit 66
+  }
+done
 mkdir -p "$agents_dir"
 for profile in raw worker-ro worker-rw agy-bridge-worker-ro-v1 agy-bridge-worker-rw-v1; do
   src="/app/agents/$profile/agent.md"
   dst_dir="$agents_dir/$profile"
+  dst="$dst_dir/agent.md"
   [[ -f "$src" ]] || { echo "missing managed agent: $src" >&2; exit 66; }
+  [[ ! -L "$dst_dir" ]] || {
+    echo "managed agent destination must not be a symlink: $dst_dir" >&2
+    exit 66
+  }
   mkdir -p "$dst_dir"
-  cp "$src" "$dst_dir/agent.md"
+  [[ ! -L "$dst" ]] || {
+    echo "managed agent destination must not be a symlink: $dst" >&2
+    exit 66
+  }
+  tmp="$(mktemp "$dst_dir/.agent.md.XXXXXX")"
+  cp "$src" "$tmp"
+  mv -f "$tmp" "$dst"
 done
 
 if [[ "$workspace_enabled" == true ]]; then
