@@ -1,10 +1,14 @@
 [CmdletBinding()]
 param(
-  [string]$VerifierPath = (Join-Path $PSScriptRoot 'verify-all.ps1')
+  [string]$VerifierPath = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($VerifierPath)) {
+  $VerifierPath = Join-Path $PSScriptRoot 'verify-all.ps1'
+}
 
 function Fail {
   param([Parameter(Mandatory = $true)][string]$Message)
@@ -191,4 +195,29 @@ if (-not $rejectedWrongWriteField) {
   Fail 'wrong write path field satisfied the exact-target evidence gate'
 }
 
-Write-Host 'PASS: verifier binds workspace native-tool evidence to the exact target'
+$observerFunction = Get-FunctionText -Name 'Wait-WorkspaceChildEnvObserver'
+if ([string]::IsNullOrWhiteSpace($observerFunction)) {
+  Fail 'verifier is missing Wait-WorkspaceChildEnvObserver'
+}
+Invoke-Expression $observerFunction
+foreach ($mode in @('ro', 'rw')) {
+  foreach ($verdict in @('CANARY_ABSENT', 'CANARY_PRESENT')) {
+    $script:FixtureTranscript = "READY`n$verdict`n"
+    $actual = Wait-WorkspaceChildEnvObserver -DeploymentMode $mode -ResultPath '/synthetic/observer' -Context 'synthetic observer'
+    if ($actual -ne $verdict) { Fail "observer changed $verdict to $actual" }
+  }
+  $script:FixtureTranscript = "READY`nINCONCLUSIVE`n"
+  $rejectedInconclusive = $false
+  try {
+    Wait-WorkspaceChildEnvObserver -DeploymentMode $mode -ResultPath '/synthetic/observer' -Context 'synthetic observer'
+  }
+  catch {
+    if ($_.Exception.Message -like '*could not read a stable child environment*') {
+      $rejectedInconclusive = $true
+    }
+    else { throw }
+  }
+  if (-not $rejectedInconclusive) { Fail "$mode accepted an inconclusive environment observation" }
+}
+
+Write-Host 'PASS: verifier binds workspace native-tool evidence to the exact target and rejects inconclusive child environments'

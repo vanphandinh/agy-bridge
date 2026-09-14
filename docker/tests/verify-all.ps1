@@ -694,6 +694,9 @@ function Wait-WorkspaceChildEnvObserver {
     if ($result.ExitCode -eq 0) {
       if ($result.Output -match '(?m)^CANARY_PRESENT$') { return 'CANARY_PRESENT' }
       if ($result.Output -match '(?m)^CANARY_ABSENT$') { return 'CANARY_ABSENT' }
+      if ($result.Output -match '(?m)^INCONCLUSIVE$') {
+        throw "$Context could not read a stable child environment; containment evidence is incomplete"
+      }
       if ($result.Output -match '(?m)^TIMEOUT$') {
         throw "$Context did not observe the expected agy child before timeout"
       }

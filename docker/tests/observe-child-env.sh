@@ -24,8 +24,18 @@ while (( SECONDS <= deadline )); do
     [[ "$cmd" == *"$first_fragment"* ]] || continue
     [[ "$cmd" == *"$second_fragment"* ]] || continue
 
-    if tr '\000' '\n' < "$proc/environ" 2>/dev/null |
-      grep -Fxq -- "$env_name=$env_value"; then
+    # Read the whole environment before matching: read errors and a vanished
+    # child are not evidence of absence, and grep -q can SIGPIPE its producer.
+    if ! child_env="$(tr '\000' '\n' < "$proc/environ" 2>/dev/null)"; then
+      printf 'INCONCLUSIVE\n' >> "$result_file"
+      exit 4
+    fi
+    current_cmd="$(tr '\000' ' ' < "$proc/cmdline" 2>/dev/null || true)"
+    if [[ -z "$current_cmd" || "$current_cmd" != "$cmd" ]]; then
+      printf 'INCONCLUSIVE\n' >> "$result_file"
+      exit 4
+    fi
+    if grep -Fxq -- "$env_name=$env_value" <<< "$child_env"; then
       printf 'CANARY_PRESENT\n' >> "$result_file"
     else
       printf 'CANARY_ABSENT\n' >> "$result_file"

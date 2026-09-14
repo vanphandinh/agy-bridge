@@ -27,6 +27,7 @@ wait_ready() {
 run_case() {
   local expected="$1"
   local canary_value="$2"
+  local expected_status="${3:-0}"
   local result
   result="$(mktemp)"
   trap 'rm -f "$result"' RETURN
@@ -51,7 +52,10 @@ run_case() {
   local child_pid=$!
   wait "$child_pid"
 
-  wait "$observer_pid" || fail "observer exited non-zero for expected $expected"
+  local observer_status=0
+  wait "$observer_pid" || observer_status=$?
+  [[ "$observer_status" -eq "$expected_status" ]] ||
+    fail "observer exited $observer_status instead of $expected_status for $expected"
   tail -n 1 "$result" | grep -Fx "$expected" >/dev/null || {
     cat "$result" >&2
     fail "observer returned the wrong environment verdict"
@@ -62,5 +66,21 @@ run_case() {
 
 run_case 'CANARY_ABSENT' ''
 run_case 'CANARY_PRESENT' 'bridge-secret'
+
+# A failed environment read must never count as proof that the canary is absent.
+# Keep the real short-lived child and observer; inject only the read failure.
+shim_dir="$(mktemp -d)"
+trap 'rm -rf "$shim_dir"' EXIT
+real_tr="$(command -v tr)"
+export OBSERVER_TEST_REAL_TR="$real_tr"
+cat > "$shim_dir/tr" <<'SHIM'
+#!/usr/bin/env bash
+if [[ "${2:-}" == '\n' ]]; then
+  exit 1
+fi
+exec "$OBSERVER_TEST_REAL_TR" "$@"
+SHIM
+chmod +x "$shim_dir/tr"
+PATH="$shim_dir:$PATH" run_case 'INCONCLUSIVE' 'bridge-secret' 4
 
 echo 'PASS: pre-armed child environment observer catches short-lived children'
