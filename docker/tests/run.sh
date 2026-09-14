@@ -17,6 +17,7 @@ bash /app/docker/tests/check-workspace-security-patterns.sh
 bash /app/docker/tests/test-workspace-security-crlf.sh
 bash /app/docker/tests/check-runagy-lifecycle.sh /app/agy-bridge.ts
 bash /app/docker/tests/check-workspace-runagy-lifecycle.sh /app/agy-bridge.ts
+bash /app/docker/tests/test-child-env-observer.sh /app/docker/tests/observe-child-env.sh
 bash /app/docker/tests/check-verify-all-policy.sh /app/docker/tests/verify-all.ps1
 bash /app/docker/tests/test-bridge.sh
 echo "PASS: deterministic Docker test suite"

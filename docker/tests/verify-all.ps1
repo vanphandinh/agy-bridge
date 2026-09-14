@@ -612,6 +612,106 @@ function Invoke-WorkspaceRwDockerCapture {
   return Invoke-DockerCapture -ArgumentList @($prefix + $ArgumentList) -AllowFailure:$AllowFailure -Quiet:$Quiet
 }
 
+function ConvertTo-ShellSingleQuoted {
+  param([Parameter(Mandatory = $true)][string]$Value)
+  if ($Value.Contains("'")) {
+    throw 'child environment observer argument contains an unsupported single quote'
+  }
+  return "'$Value'"
+}
+
+function Invoke-WorkspaceModeDockerCapture {
+  param(
+    [Parameter(Mandatory = $true)][ValidateSet('ro', 'rw')][string]$DeploymentMode,
+    [string[]]$ArgumentList = @(),
+    [switch]$AllowFailure,
+    [switch]$Quiet
+  )
+  if ($DeploymentMode -eq 'ro') {
+    return Invoke-WorkspaceDockerCapture -ArgumentList $ArgumentList -AllowFailure:$AllowFailure -Quiet:$Quiet
+  }
+  return Invoke-WorkspaceRwDockerCapture -ArgumentList $ArgumentList -AllowFailure:$AllowFailure -Quiet:$Quiet
+}
+
+function Start-WorkspaceChildEnvObserver {
+  param(
+    [Parameter(Mandatory = $true)][ValidateSet('ro', 'rw')][string]$DeploymentMode,
+    [Parameter(Mandatory = $true)][string]$FirstCommandFragment,
+    [Parameter(Mandatory = $true)][string]$SecondCommandFragment,
+    [Parameter(Mandatory = $true)][string]$EnvName,
+    [Parameter(Mandatory = $true)][string]$EnvValue
+  )
+
+  $helperPath = Join-Path (Get-Location) 'docker/tests/observe-child-env.sh'
+  if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
+    throw "missing child environment observer helper: $helperPath"
+  }
+  $helper = (Get-Content -LiteralPath $helperPath -Raw).Replace("`r", '')
+  $resultPath = "/home/agy/.local/state/agy-bridge/.verify-child-env-$([Guid]::NewGuid().ToString('N')).txt"
+  $observerArgs = @(
+    $resultPath,
+    $FirstCommandFragment,
+    $SecondCommandFragment,
+    $EnvName,
+    $EnvValue,
+    '30'
+  )
+  $setArgs = 'set -- ' + (($observerArgs | ForEach-Object { ConvertTo-ShellSingleQuoted -Value $_ }) -join ' ')
+  $runner = $setArgs + "`n" + $helper
+  $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($runner))
+  $launchScript = "printf '%s' '$encoded' | base64 -d | bash"
+
+  Invoke-WorkspaceModeDockerCapture -DeploymentMode $DeploymentMode -ArgumentList @(
+    'exec', '-T', '-d', 'agy-bridge', 'bash', '-lc', $launchScript
+  ) -Quiet | Out-Null
+
+  $deadline = [DateTime]::UtcNow.AddSeconds(5)
+  while ([DateTime]::UtcNow -lt $deadline) {
+    $ready = Invoke-WorkspaceModeDockerCapture -DeploymentMode $DeploymentMode -ArgumentList @(
+      'exec', '-T', 'agy-bridge', 'cat', $resultPath
+    ) -AllowFailure -Quiet
+    if ($ready.ExitCode -eq 0 -and $ready.Output -match '(?m)^READY$') {
+      return $resultPath
+    }
+    Start-Sleep -Milliseconds 50
+  }
+  throw "$DeploymentMode child environment observer did not become ready"
+}
+
+function Wait-WorkspaceChildEnvObserver {
+  param(
+    [Parameter(Mandatory = $true)][ValidateSet('ro', 'rw')][string]$DeploymentMode,
+    [Parameter(Mandatory = $true)][string]$ResultPath,
+    [Parameter(Mandatory = $true)][string]$Context
+  )
+
+  $deadline = [DateTime]::UtcNow.AddSeconds(35)
+  while ([DateTime]::UtcNow -lt $deadline) {
+    $result = Invoke-WorkspaceModeDockerCapture -DeploymentMode $DeploymentMode -ArgumentList @(
+      'exec', '-T', 'agy-bridge', 'cat', $ResultPath
+    ) -AllowFailure -Quiet
+    if ($result.ExitCode -eq 0) {
+      if ($result.Output -match '(?m)^CANARY_PRESENT$') { return 'CANARY_PRESENT' }
+      if ($result.Output -match '(?m)^CANARY_ABSENT$') { return 'CANARY_ABSENT' }
+      if ($result.Output -match '(?m)^TIMEOUT$') {
+        throw "$Context did not observe the expected agy child before timeout"
+      }
+    }
+    Start-Sleep -Milliseconds 50
+  }
+  throw "$Context child environment observer did not produce a verdict"
+}
+
+function Remove-WorkspaceChildEnvObserverResult {
+  param(
+    [Parameter(Mandatory = $true)][ValidateSet('ro', 'rw')][string]$DeploymentMode,
+    [Parameter(Mandatory = $true)][string]$ResultPath
+  )
+  Invoke-WorkspaceModeDockerCapture -DeploymentMode $DeploymentMode -ArgumentList @(
+    'exec', '-T', 'agy-bridge', 'rm', '-f', $ResultPath
+  ) -AllowFailure -Quiet | Out-Null
+}
+
 function Assert-LatestWorkspaceToolStep {
   param(
     [Parameter(Mandatory = $true)][ValidateSet('ro', 'rw')][string]$DeploymentMode,
@@ -679,49 +779,16 @@ function Assert-BareWorkspaceIsolation {
     'application/json'
   )
 
+  $observerResultPath = $null
   try {
-    $responseTask = $client.SendAsync($request)
-    $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Min($RequestTimeoutSec, 30))
-    $observedChild = $false
-    while ([DateTime]::UtcNow -lt $deadline -and -not $responseTask.IsCompleted) {
-      $probeScript = @"
-for proc in /proc/[0-9]*; do
-  test -r \"`$proc/cmdline\" || continue
-  cmd=`$(tr '\000' ' ' < \"`$proc/cmdline\" 2>/dev/null || true)
-  case \"`$cmd\" in
-    *'/home/agy/.local/bin/agy'*'--agent raw'*)
-      observed=`$(tr '\000' '\n' < \"`$proc/environ\" 2>/dev/null || true)
-      case \"`$observed\" in
-        *'AGY_WORKSPACE_BRIDGE_CANARY=$EnvCanary'*) echo CANARY_PRESENT ;;
-        *) echo CANARY_ABSENT ;;
-      esac
-      exit 0
-      ;;
-  esac
-done
-exit 3
-"@
-      $probeArgs = @('exec', '-T', 'agy-bridge', 'bash', '-lc', $probeScript)
-      $probe = if ($DeploymentMode -eq 'ro') {
-        Invoke-WorkspaceDockerCapture -ArgumentList $probeArgs -AllowFailure -Quiet
-      }
-      else {
-        Invoke-WorkspaceRwDockerCapture -ArgumentList $probeArgs -AllowFailure -Quiet
-      }
-      if ($probe.ExitCode -eq 0) {
-        $observedChild = $true
-        if ($probe.Output.Contains('CANARY_PRESENT')) {
-          throw "$DeploymentMode bare child received AGY_WORKSPACE_BRIDGE_CANARY"
-        }
-        if (-not $probe.Output.Contains('CANARY_ABSENT')) {
-          throw "$DeploymentMode bare child environment probe returned an unknown result"
-        }
-        break
-      }
-      Start-Sleep -Milliseconds 100
-    }
+    $observerResultPath = Start-WorkspaceChildEnvObserver `
+      -DeploymentMode $DeploymentMode `
+      -FirstCommandFragment '/home/agy/.local/bin/agy' `
+      -SecondCommandFragment '--agent raw' `
+      -EnvName 'AGY_WORKSPACE_BRIDGE_CANARY' `
+      -EnvValue $EnvCanary
 
-    $response = $responseTask.GetAwaiter().GetResult()
+    $response = $client.SendAsync($request).GetAwaiter().GetResult()
     try {
       $statusCode = [int]$response.StatusCode
       $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
@@ -741,8 +808,12 @@ exit 3
       $response.Dispose()
     }
 
-    if (-not $observedChild) {
-      throw "did not observe the live $DeploymentMode bare agy child while checking its environment"
+    $envVerdict = Wait-WorkspaceChildEnvObserver `
+      -DeploymentMode $DeploymentMode `
+      -ResultPath $observerResultPath `
+      -Context "$DeploymentMode bare child environment probe"
+    if ($envVerdict -eq 'CANARY_PRESENT') {
+      throw "$DeploymentMode bare child received AGY_WORKSPACE_BRIDGE_CANARY"
     }
     if ((Get-Sha256Hex -Path $canaryPath) -ne $beforeHash) {
       throw "$DeploymentMode bare route changed the workspace canary file"
@@ -752,6 +823,9 @@ exit 3
     [void](Get-CompletionText -Response $control)
   }
   finally {
+    if ($observerResultPath) {
+      Remove-WorkspaceChildEnvObserverResult -DeploymentMode $DeploymentMode -ResultPath $observerResultPath
+    }
     $request.Dispose()
     $client.Dispose()
   }
@@ -861,45 +935,16 @@ function Assert-WorkspaceRwEnvironmentCanaryExcluded {
     'application/json'
   )
 
+  $observerResultPath = $null
   try {
-    $responseTask = $client.SendAsync($request)
-    $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Min($RequestTimeoutSec, 30))
-    $observedChild = $false
-    while ([DateTime]::UtcNow -lt $deadline -and -not $responseTask.IsCompleted) {
-      $probeScript = @"
-for proc in /proc/[0-9]*; do
-  test -r \"`$proc/cmdline\" || continue
-  cmd=`$(tr '\000' ' ' < \"`$proc/cmdline\" 2>/dev/null || true)
-  case \"`$cmd\" in
-    *'/home/agy/.local/bin/agy'*'agy-bridge-worker-rw-v1'*)
-      observed=`$(tr '\000' '\n' < \"`$proc/environ\" 2>/dev/null || true)
-      case \"`$observed\" in
-        *'AGY_WORKSPACE_BRIDGE_CANARY=$envCanary'*) echo CANARY_PRESENT ;;
-        *) echo CANARY_ABSENT ;;
-      esac
-      exit 0
-      ;;
-  esac
-done
-exit 3
-"@
-      $probe = Invoke-WorkspaceRwDockerCapture -ArgumentList @(
-        'exec', '-T', 'agy-bridge', 'bash', '-lc', $probeScript
-      ) -AllowFailure -Quiet
-      if ($probe.ExitCode -eq 0) {
-        $observedChild = $true
-        if ($probe.Output.Contains('CANARY_PRESENT')) {
-          throw 'bridge-only RW environment canary reached the workspace agy child'
-        }
-        if (-not $probe.Output.Contains('CANARY_ABSENT')) {
-          throw 'workspace agy child environment probe returned an unknown result'
-        }
-        break
-      }
-      Start-Sleep -Milliseconds 100
-    }
+    $observerResultPath = Start-WorkspaceChildEnvObserver `
+      -DeploymentMode rw `
+      -FirstCommandFragment '/home/agy/.local/bin/agy' `
+      -SecondCommandFragment 'agy-bridge-worker-rw-v1' `
+      -EnvName 'AGY_WORKSPACE_BRIDGE_CANARY' `
+      -EnvValue $envCanary
 
-    $response = $responseTask.GetAwaiter().GetResult()
+    $response = $client.SendAsync($request).GetAwaiter().GetResult()
     try {
       $statusCode = [int]$response.StatusCode
       $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
@@ -910,12 +955,19 @@ exit 3
     finally {
       $response.Dispose()
     }
-    if (-not $observedChild) {
-      throw 'did not observe the live RW agy child while checking its environment'
+    $envVerdict = Wait-WorkspaceChildEnvObserver `
+      -DeploymentMode rw `
+      -ResultPath $observerResultPath `
+      -Context 'RW environment canary probe'
+    if ($envVerdict -eq 'CANARY_PRESENT') {
+      throw 'bridge-only RW environment canary reached the workspace agy child'
     }
     $script:WorkspaceRwEnvProbePassed = $true
   }
   finally {
+    if ($observerResultPath) {
+      Remove-WorkspaceChildEnvObserverResult -DeploymentMode rw -ResultPath $observerResultPath
+    }
     $request.Dispose()
     $client.Dispose()
   }

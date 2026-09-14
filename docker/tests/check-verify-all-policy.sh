@@ -60,6 +60,9 @@ required=(
   'RW denial probe requires HTTP 200 explicit DENIED evidence'
   'RW reserved-agent shadow denial probe requires HTTP 200 explicit DENIED evidence'
   'function Assert-LatestWorkspaceToolStep'
+  'function Start-WorkspaceChildEnvObserver'
+  'observe-child-env.sh'
+  "'exec', '-T', '-d', 'agy-bridge'"
   "[ValidateSet('ro', 'rw')][string]\$DeploymentMode"
   'tool_step_updates'
   'Assert-LatestWorkspaceToolStep -DeploymentMode ro -Context "RO read denial probe for $Path"'
@@ -130,6 +133,16 @@ for needle in "${required[@]}"; do
     exit 1
   }
 done
+
+grep -F -- 'test-child-env-observer.sh /app/docker/tests/observe-child-env.sh' "$suite_file" >/dev/null || {
+  echo 'deterministic Docker suite is missing the pre-armed child observer regression' >&2
+  exit 1
+}
+
+if grep -F -- '$responseTask.IsCompleted' "$file" >/dev/null; then
+  echo 'live child environment observation must be pre-armed before the request, not raced against response completion' >&2
+  exit 1
+fi
 
 if grep -F -- '$res.StatusCode -ne 200 -and $res.StatusCode -ne 502' "$file" >/dev/null; then
   echo 'RO workspace mutation probe must not accept HTTP 502 as immutability evidence' >&2
