@@ -35,6 +35,23 @@ frontmatter_has_name() {
   ' "$file"
 }
 
+assert_workspace_hooks_absent() {
+  local hook_path plugin_root
+  for hook_path in /workspace/.agents/hooks.json /workspace/_agents/hooks.json; do
+    if [[ -e "$hook_path" || -L "$hook_path" ]]; then
+      fail "workspace hooks are not allowed in explicit workspace mode: $hook_path"
+    fi
+  done
+
+  for plugin_root in /workspace/.agents/plugins /workspace/_agents/plugins; do
+    [[ ! -L "$plugin_root" ]] || fail "workspace plugin root must not be a symlink: $plugin_root"
+    [[ -d "$plugin_root" ]] || continue
+    if find "$plugin_root" -name hooks.json \( -type f -o -type l \) -print -quit | grep -q .; then
+      fail "workspace plugin hooks are not allowed in explicit workspace mode: $plugin_root"
+    fi
+  done
+}
+
 assert_plugin_agent_names() {
   local mode="$1"
   local reserved=(agy-bridge-worker-ro-v1)
@@ -80,6 +97,7 @@ assert_agent_paths() {
       fail "reserved workspace agent collision: $path"
     fi
   done
+  assert_workspace_hooks_absent
   assert_plugin_agent_names "$mode"
 }
 
