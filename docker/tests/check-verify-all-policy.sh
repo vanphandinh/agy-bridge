@@ -126,7 +126,7 @@ identity_required=(
   '[string]$BaseRef'
   '06567660cb765285cf68f28637169c79ddd1aabc'
   '832d87d32bbc08ed1cb8ef105d41a7c4f27c4a63'
-  'git rev-parse HEAD'
+  "'rev-parse', 'HEAD'"
   '--untracked-files=all'
   'Base ref mismatch'
   "'rev-list', '--parents'"
