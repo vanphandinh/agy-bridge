@@ -1312,3 +1312,27 @@ Before executing this plan, verify:
 [x] full live verifier runs on exact final SHA with no skip flags
 [x] no commit is allowed after full live PASS
 ```
+
+## 2026-09-14 Independent PR #9 Audit / Debug Loop
+
+**Goal:** audit the completed PR independently, fix every merge-blocking or
+serious defect with regression coverage, and repeat until a fresh pass finds no
+serious defect.
+
+- [x] Synchronize local `impl/pr4-read-write-host-workspace` with `origin` and
+  establish a clean baseline at `a21925118e6f946318367a2f87287905f2ec5fc8`.
+- [x] Reproduce the Windows-host deterministic-suite failure in
+  `verify-all.ps1 -SkipLive`.
+- [x] Root cause the failure: the CRLF fixture appended `\r\n` to source lines
+  that can already end in `\r`, producing `\r\r\n` only on CRLF worktrees.
+- [x] Make fixture generation checkout-agnostic by removing one existing
+  trailing CR before emitting canonical CRLF.
+- [x] Run the focused CRLF regression and canonical deterministic Docker suite.
+- [x] Run the complete non-live verifier on a clean exact candidate SHA.
+- [x] Re-audit routing, policy ordering, child environment, managed-agent
+  isolation, Compose/rootfs/mount boundaries, exact-version gates, and verifier
+  false-positive/false-negative paths.
+- [x] For every additional serious defect, add a focused RED regression, make
+  the smallest root-cause fix, and rerun focused plus broad gates.
+- [ ] Run final Deno test/lint/type-check and Docker/verifier gates, review the
+  final diff, push normally to `origin`, then prove local and remote HEAD match.

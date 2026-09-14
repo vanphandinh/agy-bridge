@@ -24,7 +24,7 @@ for path in "${production_paths[@]}"; do
 done
 
 rw_agent="$work/agents/agy-bridge-worker-rw-v1/agent.md"
-awk '{ printf "%s\r\n", $0 }' "$rw_agent" > "$rw_agent.crlf"
+awk '{ sub(/\r$/, ""); printf "%s\r\n", $0 }' "$rw_agent" > "$rw_agent.crlf"
 mv "$rw_agent.crlf" "$rw_agent"
 
 (
