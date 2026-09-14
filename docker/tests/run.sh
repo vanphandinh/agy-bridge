@@ -10,6 +10,7 @@ bash /app/docker/tests/check-dockerignore-policy.sh /app/.dockerignore
 bash /app/docker/tests/test-secrets.sh
 bash /app/docker/tests/test-keyring.sh
 bash /app/docker/tests/test-workspace-policy.sh /app/docker/workspace-policy.sh
+bash /app/docker/tests/test-workspace-plugin-agent-collision.sh /app/docker/workspace-policy.sh
 bash /app/docker/tests/check-runtime-permissions.sh /app/docker/start-bridge.sh
 bash /app/docker/tests/check-workspace-security-patterns.sh
 bash /app/docker/tests/test-workspace-security-crlf.sh
