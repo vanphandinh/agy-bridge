@@ -87,6 +87,8 @@ case '$SymlinkKind' in
 esac
 exec /app/docker/start-bridge.sh
 "@
+  # A Windows checkout gives here-strings CRLF; Bash requires LF line endings.
+  $bootstrap = $bootstrap.Replace("`r", '')
 
   $previousErrorAction = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
