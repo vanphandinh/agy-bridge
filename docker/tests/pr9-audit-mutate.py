@@ -53,14 +53,14 @@ new = """  const result: AgyResult = { ok: false, text: "" };
 assert text.count(old) == 1, "runAgy counter anchor mismatch"
 text = text.replace(old, new)
 
-old = """      if (ev.event === "step_update") {
-        const su = ev.step_update as Record<string, unknown>;
-        if (typeof su.text_delta === "string" && su.text_delta !== "") {
+old = """        if (ev.event === "step_update") {
+          const su = ev.step_update as Record<string, unknown>;
+          if (typeof su.text_delta === "string" && su.text_delta !== "") {
 """
-new = """      if (ev.event === "step_update") {
-        const su = ev.step_update as Record<string, unknown>;
-        if (su.step_type === "tool") toolStepUpdates++;
-        if (typeof su.text_delta === "string" && su.text_delta !== "") {
+new = """        if (ev.event === "step_update") {
+          const su = ev.step_update as Record<string, unknown>;
+          if (su.step_type === "tool") toolStepUpdates++;
+          if (typeof su.text_delta === "string" && su.text_delta !== "") {
 """
 assert text.count(old) == 1, "step_update anchor mismatch"
 text = text.replace(old, new)
