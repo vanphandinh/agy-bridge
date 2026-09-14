@@ -103,6 +103,7 @@ try {
     $_ -ne 'Dockerfile' -and
     $_ -ne 'agy-bridge.ts' -and
     $_ -ne 'compose.workspace-rw.yaml' -and
+    $_ -ne 'agents/agy-bridge-worker-ro-v1/agent.md' -and
     $_ -ne 'agents/agy-bridge-worker-rw-v1/agent.md' -and
     $_ -ne 'docker/start-bridge.sh' -and
     $_ -ne 'docker/workspace-policy.sh' -and
