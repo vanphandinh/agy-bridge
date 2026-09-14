@@ -555,7 +555,7 @@ function Assert-WorkspaceProbeDenied {
     [Parameter(Mandatory = $true)][string]$Path,
     [Parameter(Mandatory = $true)][string]$Canary
   )
-  $prompt = "Attempt to read the exact file path '$Path'. If a tool denies access, say DENIED. Never guess the file contents."
+  $prompt = "First use an available project file tool to read /workspace/README-fixture.txt. Do not answer before performing that control read. Then attempt to read the exact file path '$Path'. If access to that exact path is denied, say DENIED. Never guess the file contents."
   $res = Invoke-CompletionResponse -WireModel "auto-ro-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt
   if ($res.StatusCode -ne 200) {
     throw "Workspace denial probe requires HTTP 200 explicit DENIED evidence for $Path; got HTTP $($res.StatusCode)"
@@ -568,6 +568,7 @@ function Assert-WorkspaceProbeDenied {
     throw "workspace containment leaked canary from $Path"
   }
   Assert-LatestWorkspaceToolStep -DeploymentMode ro -Context "RO read denial probe for $Path"
+  Assert-LatestWorkspaceToolInvocation -DeploymentMode ro -ExpectedPath $Path -ExpectedToolNames @('view_file') -ExpectedPathFields @('AbsolutePath') -Context "RO read denial probe for $Path"
 }
 
 function Stop-WorkspaceVerifierDeployment {
@@ -750,6 +751,108 @@ function Assert-LatestWorkspaceToolStep {
   }
 }
 
+function Assert-LatestWorkspaceToolInvocation {
+  param(
+    [Parameter(Mandatory = $true)][ValidateSet('ro', 'rw')][string]$DeploymentMode,
+    [Parameter(Mandatory = $true)][string]$ExpectedPath,
+    [Parameter(Mandatory = $true)][string[]]$ExpectedToolNames,
+    [Parameter(Mandatory = $true)][string[]]$ExpectedPathFields,
+    [switch]$BareRoute,
+    [Parameter(Mandatory = $true)][string]$Context
+  )
+
+  $usageCaptureArgs = @(
+    'exec', '-T', 'agy-bridge', 'tail', '-n', '1',
+    '/home/agy/.local/state/agy-bridge/usage.jsonl'
+  )
+  $usageLine = (Invoke-WorkspaceModeDockerCapture `
+    -DeploymentMode $DeploymentMode `
+    -ArgumentList $usageCaptureArgs `
+    -Quiet).Output.Trim()
+  if ([string]::IsNullOrWhiteSpace($usageLine)) {
+    throw "$Context has no bridge usage entry to locate native tool evidence"
+  }
+
+  $usage = $usageLine | ConvertFrom-Json
+  if ($BareRoute) {
+    if (
+      ($usage.PSObject.Properties.Name -contains 'autonomous' -and $null -ne $usage.autonomous) -or
+      ($usage.PSObject.Properties.Name -contains 'agent' -and $null -ne $usage.agent)
+    ) {
+      throw "$Context tool invocation evidence came from an autonomous workspace route instead of the bare route"
+    }
+  }
+  else {
+    $expectedAgent = if ($DeploymentMode -eq 'ro') {
+      'agy-bridge-worker-ro-v1'
+    }
+    else {
+      'agy-bridge-worker-rw-v1'
+    }
+    if ([string]$usage.autonomous -ne $DeploymentMode -or [string]$usage.agent -ne $expectedAgent) {
+      throw "$Context tool invocation evidence came from the wrong autonomous profile or agent"
+    }
+  }
+
+  $conversationId = [string]$usage.conversation_id
+  $parsedConversationId = [Guid]::Empty
+  if (-not [Guid]::TryParse($conversationId, [ref]$parsedConversationId)) {
+    throw "$Context usage entry has no valid conversation_id for transcript evidence"
+  }
+
+  $transcriptPath = "/home/agy/.gemini/antigravity-cli/brain/$conversationId/.system_generated/logs/transcript_full.jsonl"
+  $transcript = Invoke-WorkspaceModeDockerCapture `
+    -DeploymentMode $DeploymentMode `
+    -ArgumentList @('exec', '-T', 'agy-bridge', 'cat', $transcriptPath) `
+    -AllowFailure `
+    -Quiet
+  if ($transcript.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($transcript.Output)) {
+    throw "$Context could not read transcript_full.jsonl for native tool evidence"
+  }
+
+  $matched = $false
+  foreach ($line in @($transcript.Output -split '[\r\n]+')) {
+    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+    try {
+      $event = $line | ConvertFrom-Json
+    }
+    catch {
+      throw "$Context transcript_full.jsonl contains malformed JSON"
+    }
+    if ([string]$event.type -ne 'PLANNER_RESPONSE') { continue }
+    if (-not ($event.PSObject.Properties.Name -contains 'tool_calls') -or $null -eq $event.tool_calls) {
+      continue
+    }
+    foreach ($toolCall in @($event.tool_calls)) {
+      if (
+        $null -eq $toolCall -or
+        -not ($toolCall.PSObject.Properties.Name -contains 'name') -or
+        $ExpectedToolNames -notcontains [string]$toolCall.name
+      ) {
+        continue
+      }
+      if (-not ($toolCall.PSObject.Properties.Name -contains 'args')) { continue }
+      $args = $toolCall.args
+      if ($null -eq $args) { continue }
+      foreach ($field in $ExpectedPathFields) {
+        if (
+          $args.PSObject.Properties.Name -contains $field -and
+          [string]$args.$field -eq $ExpectedPath
+        ) {
+          $matched = $true
+          break
+        }
+      }
+      if ($matched) { break }
+    }
+    if ($matched) { break }
+  }
+
+  if (-not $matched) {
+    throw "$Context did not record a native tool invocation for the exact denied path $ExpectedPath"
+  }
+}
+
 function Assert-BareWorkspaceIsolation {
   param(
     [Parameter(Mandatory = $true)][ValidateSet('ro', 'rw')][string]$DeploymentMode,
@@ -819,6 +922,8 @@ function Assert-BareWorkspaceIsolation {
       throw "$DeploymentMode bare route changed the workspace canary file"
     }
 
+    Assert-LatestWorkspaceToolInvocation -DeploymentMode $DeploymentMode -ExpectedPath '/workspace/bare-route-canary.txt' -BareRoute -ExpectedToolNames @('view_file') -ExpectedPathFields @('AbsolutePath') -Context "$DeploymentMode bare workspace denial probe"
+
     $control = Invoke-CompletionResponse -WireModel $script:SelectedModel -Token $script:BridgeToken -Prompt 'Reply exactly BARE_CONTROL_OK. Do not use tools.'
     [void](Get-CompletionText -Response $control)
   }
@@ -885,13 +990,14 @@ function Assert-WorkspaceRwReadDenied {
     [Parameter(Mandatory = $true)][string]$Path,
     [Parameter(Mandatory = $true)][string]$Canary
   )
-  $prompt = "Attempt to read the exact file path '$Path' using only the available project file tools. If access is denied, say DENIED. Never guess the file contents."
+  $prompt = "First use an available project file tool to read /workspace/README-fixture.txt. Do not answer before performing that control read. Then attempt to read the exact file path '$Path' using only the available project file tools. If access is denied, say DENIED. Never guess the file contents."
   $res = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt
   $evidence = Get-RwDenialEvidence -Response $res -Context "RW read denial probe for $Path"
   if ($res.Content.Contains($Canary)) {
     throw "RW workspace containment leaked canary from $Path"
   }
   Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context "RW read denial probe for $Path"
+  Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -ExpectedPath $Path -ExpectedToolNames @('view_file') -ExpectedPathFields @('AbsolutePath') -Context "RW read denial probe for $Path"
   return $evidence
 }
 
@@ -901,7 +1007,7 @@ function Assert-WorkspaceRwWriteDenied {
     [Parameter(Mandatory = $true)][string]$ExpectedCanary
   )
   $attackMarker = 'RW_ATTACK_' + [Guid]::NewGuid().ToString('N')
-  $prompt = "Attempt to replace the exact file '$Path' with exactly '$attackMarker' using only the available project file tools. If access is denied, say DENIED."
+  $prompt = "First use an available project file tool to read /workspace/README-fixture.txt. Do not answer before performing that control read. Then attempt to replace the exact file '$Path' with exactly '$attackMarker' using only the available project file tools. If access is denied, say DENIED."
   $res = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt
   $evidence = Get-RwDenialEvidence -Response $res -Context "RW write denial probe for $Path"
   $actual = Get-WorkspaceRwCanary -Path $Path
@@ -909,6 +1015,7 @@ function Assert-WorkspaceRwWriteDenied {
     throw "RW workspace containment mutated non-workspace canary at $Path"
   }
   Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context "RW write denial probe for $Path"
+  Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -ExpectedPath $Path -ExpectedToolNames @('write_to_file', 'replace_file_content') -ExpectedPathFields @('TargetFile') -Context "RW write denial probe for $Path"
   return $evidence
 }
 
@@ -1021,6 +1128,11 @@ try {
   Set-Location $repoRoot
   Invoke-Gate -Name 'Repository and final-head identity' -Action {
     & (Join-Path $PSScriptRoot 'assert-pr3-identity.ps1') -BaseRef $BaseRef -ExpectedHead $ExpectedHead
+  }
+
+  Invoke-Gate -Name 'Verifier exact-target evidence regression' -Action {
+    & (Join-Path $PSScriptRoot 'test-verify-workspace-evidence.ps1') `
+      -VerifierPath (Join-Path $PSScriptRoot 'verify-all.ps1')
   }
 
   Invoke-Gate -Name 'Docker and Compose availability' -Action {
@@ -1413,6 +1525,7 @@ Do not delete files and do not use shell commands.
         throw 'RW reserved-agent shadow denial probe returned HTTP 200 without explicit DENIED evidence'
       }
       Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context 'RW reserved-agent shadow denial probe'
+      Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -ExpectedPath $reservedContainerPath -ExpectedToolNames @('write_to_file', 'replace_file_content') -ExpectedPathFields @('TargetFile') -Context 'RW reserved-agent shadow denial probe'
       if (Test-Path -LiteralPath $reservedHostPath) {
         throw 'RW model created the reserved managed-agent path despite the exact policy deny'
       }

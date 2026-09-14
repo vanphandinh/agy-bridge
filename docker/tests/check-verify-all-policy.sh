@@ -5,6 +5,7 @@ identity_file="${2:-/app/docker/tests/assert-pr3-identity.ps1}"
 identity_test="${3:-/app/docker/tests/test-verifier-identity.ps1}"
 docs_file="${4:-/app/docs/docker-compose.md}"
 suite_file="${5:-/app/docker/tests/run.sh}"
+evidence_test="${6:-/app/docker/tests/test-verify-workspace-evidence.ps1}"
 
 [[ -f "$file" ]] || {
   echo "missing full verifier: $file" >&2
@@ -31,6 +32,11 @@ suite_file="${5:-/app/docker/tests/run.sh}"
   exit 1
 }
 
+[[ -f "$evidence_test" ]] || {
+  echo "missing exact-target evidence regression: $evidence_test" >&2
+  exit 1
+}
+
 required=(
   '[string]$ExpectedHead'
   '[string]$Model'
@@ -42,6 +48,8 @@ required=(
   'test-compose.ps1'
   'test-compose-workspace.ps1'
   'test-compose-workspace-rw.ps1'
+  'test-verify-workspace-evidence.ps1'
+  'Verifier exact-target evidence regression'
   'compose.workspace.yaml'
   'compose.workspace-rw.yaml'
   'AGY_WORKSPACE_HOST_PATH'
@@ -60,6 +68,11 @@ required=(
   'RW denial probe requires HTTP 200 explicit DENIED evidence'
   'RW reserved-agent shadow denial probe requires HTTP 200 explicit DENIED evidence'
   'function Assert-LatestWorkspaceToolStep'
+  'function Assert-LatestWorkspaceToolInvocation'
+  'transcript_full.jsonl'
+  'conversation_id'
+  '[string[]]$ExpectedToolNames'
+  '[string[]]$ExpectedPathFields'
   'function Start-WorkspaceChildEnvObserver'
   'observe-child-env.sh'
   "'exec', '-T', '-d', 'agy-bridge'"
@@ -69,7 +82,12 @@ required=(
   'Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context "RW read denial probe for $Path"'
   'Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context "RW write denial probe for $Path"'
   "Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context 'RW reserved-agent shadow denial probe'"
+  'Assert-LatestWorkspaceToolInvocation -DeploymentMode ro -ExpectedPath $Path'
+  'Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -ExpectedPath $Path'
+  'Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -ExpectedPath $reservedContainerPath'
+  "Assert-LatestWorkspaceToolInvocation -DeploymentMode \$DeploymentMode -ExpectedPath '/workspace/bare-route-canary.txt' -BareRoute"
   'did not reach a native tool step'
+  'did not record a native tool invocation for the exact denied path'
   'Workspace denial probe requires HTTP 200 explicit DENIED evidence'
   'bare workspace probe requires HTTP 200 explicit DENIED evidence'
   'RW Docker control-surface assertions'
@@ -79,6 +97,7 @@ required=(
   'workspace mutation probe requires HTTP 200 evidence'
   'Workspace auto-rw denial'
   'Workspace non-workspace canary denial'
+  'First use an available project file tool to read /workspace/README-fixture.txt.'
   'RO bare-route workspace isolation'
   'RW bare-route workspace isolation'
   '/app/.workspace-app-canary/value.txt'
@@ -133,6 +152,12 @@ for needle in "${required[@]}"; do
     exit 1
   }
 done
+
+control_read_probe_count="$(grep -F -c -- 'First use an available project file tool to read /workspace/README-fixture.txt.' "$file" || true)"
+if [[ "$control_read_probe_count" -lt 3 ]]; then
+  echo "RO/RW non-workspace denial probes must force a native in-workspace control read before policy denial; found $control_read_probe_count prompt(s)" >&2
+  exit 1
+fi
 
 grep -F -- 'test-child-env-observer.sh /app/docker/tests/observe-child-env.sh' "$suite_file" >/dev/null || {
   echo 'deterministic Docker suite is missing the pre-armed child observer regression' >&2
