@@ -121,36 +121,36 @@ try {
   $worktrees += $allowedWorktree
   New-Item -ItemType Directory -Force -Path (Join-Path $allowedWorktree 'docker/tests') | Out-Null
   New-Item -ItemType Directory -Force -Path (Join-Path $allowedWorktree 'docs') | Out-Null
+  New-Item -ItemType Directory -Force -Path (Join-Path $allowedWorktree 'agents/agy-bridge-worker-ro-v1') | Out-Null
   New-Item -ItemType Directory -Force -Path (Join-Path $allowedWorktree 'agents/agy-bridge-worker-rw-v1') | Out-Null
   Set-Content -NoNewline -Path (Join-Path $allowedWorktree 'docker/tests/identity-allowed.txt') -Value 'allowed verifier test change'
   Set-Content -NoNewline -Path (Join-Path $allowedWorktree 'docs/docker-compose.md') -Value 'allowed docs change'
   Set-Content -NoNewline -Path (Join-Path $allowedWorktree 'compose.workspace-rw.yaml') -Value 'services: {}'
+  Set-Content -NoNewline -Path (Join-Path $allowedWorktree 'agents/agy-bridge-worker-ro-v1/agent.md') -Value 'allowed RO agent hardening fixture'
   Set-Content -NoNewline -Path (Join-Path $allowedWorktree 'agents/agy-bridge-worker-rw-v1/agent.md') -Value 'allowed RW agent fixture'
   Set-Content -NoNewline -Path (Join-Path $allowedWorktree '.github/workflows/linux-docker-deterministic.yml') -Value 'name: allowed PR4 workflow fixture'
-  Invoke-Git -WorkingDirectory $allowedWorktree -ArgumentList @('add', 'docker/tests/identity-allowed.txt', 'docs/docker-compose.md', 'compose.workspace-rw.yaml', 'agents/agy-bridge-worker-rw-v1/agent.md', '.github/workflows/linux-docker-deterministic.yml') | Out-Null
+  Invoke-Git -WorkingDirectory $allowedWorktree -ArgumentList @('add', 'docker/tests/identity-allowed.txt', 'docs/docker-compose.md', 'compose.workspace-rw.yaml', 'agents/agy-bridge-worker-ro-v1/agent.md', 'agents/agy-bridge-worker-rw-v1/agent.md', '.github/workflows/linux-docker-deterministic.yml') | Out-Null
   Invoke-Git -WorkingDirectory $allowedWorktree -ArgumentList @(
     '-c', 'user.name=PR4 Identity Test',
     '-c', 'user.email=pr4-identity-test@example.invalid',
     'commit', '-m', 'test: allowed PR4 identity fixture'
   ) | Out-Null
 
-  # allowed PR4 verifier/docs/runtime/workflow diff
+  # allowed PR4 verifier/docs/runtime/workflow diff, including the managed RO
+  # agent hardening needed to preserve the PR3 boundary under agy 1.2.2.
   Assert-Pass -Name 'allowed PR4 verifier/docs/runtime/workflow diff' -Result (Invoke-Identity -WorkingDirectory $allowedWorktree -BaseRef $expectedBase)
 
   $untrackedCanary = Join-Path $allowedWorktree "LOCAL-ONLY-UNTRACKED-$([Guid]::NewGuid().ToString('N')).txt"
   Set-Content -NoNewline -Path $untrackedCanary -Value 'arbitrary local-only file'
 
-  # arbitrary untracked local state
   Assert-Fail -Name 'arbitrary untracked local file' -Result (Invoke-Identity -WorkingDirectory $allowedWorktree -BaseRef $expectedBase) -MessagePattern 'working tree is not clean'
   Remove-Item -Force $untrackedCanary
 
-  # wrong frozen base
   Assert-Fail -Name 'wrong frozen base' -Result (Invoke-Identity -WorkingDirectory $allowedWorktree -BaseRef $oldBase) -MessagePattern 'Base ref mismatch'
 
   Invoke-Git -WorkingDirectory $repoRoot -ArgumentList @('worktree', 'add', '--detach', $nonAncestorWorktree, $prePr1) | Out-Null
   $worktrees += $nonAncestorWorktree
 
-  # non-ancestor base
   Assert-Fail -Name 'non-ancestor base' -Result (Invoke-Identity -WorkingDirectory $nonAncestorWorktree -BaseRef $expectedBase) -MessagePattern 'not an ancestor'
 
   Invoke-Git -WorkingDirectory $repoRoot -ArgumentList @('worktree', 'add', '--detach', $disallowedWorktree, $expectedBase) | Out-Null
@@ -163,7 +163,6 @@ try {
     'commit', '-m', 'test: disallowed PR4 identity fixture'
   ) | Out-Null
 
-  # disallowed changed path
   Assert-Fail -Name 'disallowed changed path' -Result (Invoke-Identity -WorkingDirectory $disallowedWorktree -BaseRef $expectedBase) -MessagePattern 'disallowed path'
 
   Write-Host 'PASS: PR4 identity regression scenarios'
