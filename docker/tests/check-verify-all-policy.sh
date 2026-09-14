@@ -57,8 +57,7 @@ required=(
   'RW symlink denial'
   'RW environment canary exclusion'
   'RW_CONTROL_OK'
-  'TransportFailure'
-  'inconclusive'
+  'RW denial probe requires HTTP 200 explicit DENIED evidence'
   'RW Docker control-surface assertions'
   'Workspace exact agy version gate and fixture setup'
   'Workspace read access'
@@ -133,6 +132,7 @@ identity_required=(
   '--is-ancestor'
   "'diff', '--name-only'"
   '^docker/tests/'
+  '.github/workflows/linux-docker-deterministic.yml'
   'compose.workspace-rw.yaml'
   'agents/agy-bridge-worker-rw-v1/agent.md'
   'docker/workspace/verified-rw-agy-versions.txt'
@@ -154,7 +154,8 @@ identity_regression_required=(
   'non-ancestor base'
   'disallowed changed path'
   'arbitrary untracked local file'
-  'allowed PR4 verifier/docs/runtime diff'
+  'allowed PR4 verifier/docs/runtime/workflow diff'
+  'PR4 Linux deterministic workflow identity wiring'
 )
 
 for needle in "${identity_regression_required[@]}"; do
@@ -184,24 +185,16 @@ if grep -F -- '878bb90a16281cc66a0c8ef849bb4329c2fab665' "$docs_file" >/dev/null
   exit 1
 fi
 
-# The Docker Desktop checkpoint must prove an observed daemon outage rather
-# than require a container StartedAt change. Desktop/daemon restarts can keep
-# a container runtime alive, and prior gates already prove container restart,
-# down/up, recreate, and rebuild persistence independently.
 if grep -F -- 'container StartedAt did not change' "$file" >/dev/null; then
   echo 'full verifier must not use container StartedAt as Docker Desktop restart proof' >&2
   exit 1
 fi
 
-# Restart probes must be independently time-bounded. A synchronous
-# Invoke-DockerCapture('info') can hang on the Windows Docker named pipe while
-# Docker Desktop is restarting and freeze the whole verifier.
 if grep -F -- "Invoke-DockerCapture -ArgumentList @('info')" "$file" >/dev/null; then
   echo 'Docker Desktop restart probe must not call blocking Invoke-DockerCapture docker info' >&2
   exit 1
 fi
 
-# The verifier must never require host Deno/Bash/Python for the Deno gates.
 if grep -E '^[[:space:]]*&?[[:space:]]*deno[[:space:]]+(lint|task test)' "$file" >/dev/null; then
   echo 'full verifier must run Deno checks inside the Docker test service' >&2
   exit 1
