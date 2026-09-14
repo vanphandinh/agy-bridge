@@ -28,8 +28,8 @@ frontmatter_has_name() {
       sub(/[[:space:]]+$/, "", value)
       if (value == target || value == "\"" target "\"" || value == "\047" target "\047") {
         found=1
+        exit
       }
-      exit
     }
     END { exit(found ? 0 : 1) }
   ' "$file"
