@@ -41,14 +41,14 @@ test.write_text(text.replace(old, new))
 bridge = Path("agy-bridge.ts")
 text = bridge.read_text()
 
-old = """  let recoveredSalvage = false;
-
-  try {
+old = """  const result: AgyResult = { ok: false, text: "" };
+  let recoveredSalvage = false;
+  let watchdog: ReturnType<typeof setTimeout> | null = null;
 """
-new = """  let recoveredSalvage = false;
+new = """  const result: AgyResult = { ok: false, text: "" };
+  let recoveredSalvage = false;
   let toolStepUpdates = 0;
-
-  try {
+  let watchdog: ReturnType<typeof setTimeout> | null = null;
 """
 assert text.count(old) == 1, "runAgy counter anchor mismatch"
 text = text.replace(old, new)
