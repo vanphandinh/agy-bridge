@@ -743,6 +743,7 @@ async function runAgy(
   let workspacePolicyApplied = false;
   let workspaceChildStatus: Promise<Deno.CommandStatus> | null = null;
   let workspaceChildKill: (() => void) | null = null;
+  let toolStepUpdates = 0;
   const workspace = execution.workspace;
 
   try {
@@ -904,6 +905,7 @@ async function runAgy(
               kind = "thought";
             } else if (su.step_type === "tool") {
               kind = "tool";
+              toolStepUpdates++;
             } else {
               kind = "unknown";
               console.error("unknown step_type:", su.step_type, su);
@@ -1026,6 +1028,7 @@ async function runAgy(
       conversation_id: result.conversationId,
       tokens: result.usage,
       error: result.error,
+      tool_step_updates: toolStepUpdates,
       ...(recoveredSalvage ? { recovered: true } : {}),
       ...(handlers.log ?? {}),
     });

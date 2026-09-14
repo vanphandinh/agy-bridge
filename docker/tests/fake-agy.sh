@@ -44,5 +44,9 @@ if [[ "$input" == *'FAKE_HANG'* ]]; then
   exit 1
 fi
 
+if [[ "$input" == *'FAKE_TOOL_STEP'* ]]; then
+  printf '%s\n' '{"event":"step_update","step_update":{"step_type":"tool","text_delta":"fake tool activity"}}'
+fi
+
 printf '%s\n' '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"fake reply"}}'
 printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"fake reply","conversation_id":"fake-conversation","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}'

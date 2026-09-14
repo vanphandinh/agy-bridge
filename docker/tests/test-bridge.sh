@@ -421,6 +421,22 @@ grep -q '^HOME=' "$rw_env" || fail "RW workspace child missing HOME"
 grep -q '^PATH=' "$rw_env" || fail "RW workspace child missing PATH"
 [[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "RW workspace policy backup remained after successful request"
 
+# Live containment verification needs an auditable signal that an autonomous
+# request actually reached a native tool step rather than merely replying with
+# the word DENIED. Keep the usage evidence content-free: only record the count
+# of tool step updates for the completed request.
+tool_step_rw="$(curl -fsS \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"FAKE_TOOL_STEP"}]}' \
+  http://127.0.0.1:17424/v1/chat/completions)"
+[[ "$tool_step_rw" == *'fake reply'* ]] || fail "RW tool-step evidence request did not complete"
+jq -e '
+  .autonomous == "rw" and
+  .agent == "agy-bridge-worker-rw-v1" and
+  .tool_step_updates == 1
+' < <(tail -n 1 "$STATE_DIR/usage.jsonl") >/dev/null || fail "RW usage log did not record exactly one native tool step update"
+
 # A writable RW request can create a workspace-local file after startup. If it
 # plants the reserved managed-agent path, the next request must fail before a
 # second agy child is spawned.

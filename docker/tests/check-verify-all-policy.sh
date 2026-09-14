@@ -58,6 +58,15 @@ required=(
   'RW environment canary exclusion'
   'RW_CONTROL_OK'
   'RW denial probe requires HTTP 200 explicit DENIED evidence'
+  'RW reserved-agent shadow denial probe requires HTTP 200 explicit DENIED evidence'
+  'function Assert-LatestWorkspaceToolStep'
+  "[ValidateSet('ro', 'rw')][string]\$DeploymentMode"
+  'tool_step_updates'
+  'Assert-LatestWorkspaceToolStep -DeploymentMode ro -Context "RO read denial probe for $Path"'
+  'Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context "RW read denial probe for $Path"'
+  'Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context "RW write denial probe for $Path"'
+  "Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context 'RW reserved-agent shadow denial probe'"
+  'did not reach a native tool step'
   'Workspace denial probe requires HTTP 200 explicit DENIED evidence'
   'bare workspace probe requires HTTP 200 explicit DENIED evidence'
   'RW Docker control-surface assertions'
@@ -120,6 +129,11 @@ for needle in "${required[@]}"; do
     exit 1
   }
 done
+
+if grep -F -- 'RW reserved-agent shadow denial probe returned unexpected HTTP' "$file" >/dev/null; then
+  echo 'RW reserved-agent shadow denial must not accept HTTP 502 as positive containment evidence' >&2
+  exit 1
+fi
 
 identity_required=(
   '[string]$ExpectedHead'
