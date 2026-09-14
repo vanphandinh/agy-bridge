@@ -23,6 +23,7 @@ forbidden_patterns=(
 )
 
 failed=0
+ro_agent="agents/agy-bridge-worker-ro-v1/agent.md"
 rw_agent="agents/agy-bridge-worker-rw-v1/agent.md"
 
 for path in "${production_files[@]}"; do
@@ -39,17 +40,47 @@ for pattern in "${forbidden_patterns[@]}"; do
   fi
 done
 
-if grep -nF -- 'run_command' agents/agy-bridge-worker-rw-v1/agent.md; then
+if grep -nF -- 'run_command' "$rw_agent"; then
   echo 'dedicated RW workspace agent must not expose run_command' >&2
   failed=1
 fi
 
-actual_rw_frontmatter="$(awk '
-  { sub(/\r$/, "") }
-  NR == 1 && $0 == "---" { in_frontmatter=1; next }
-  in_frontmatter && $0 == "---" { exit }
-  in_frontmatter { print }
-' "$rw_agent")"
+frontmatter() {
+  awk '
+    { sub(/\r$/, "") }
+    NR == 1 && $0 == "---" { in_frontmatter=1; next }
+    in_frontmatter && $0 == "---" { exit }
+    in_frontmatter { print }
+  ' "$1"
+}
+
+actual_ro_frontmatter="$(frontmatter "$ro_agent")"
+expected_ro_frontmatter="$(cat <<'EOF'
+name: agy-bridge-worker-ro-v1
+description: Read-only bridge workspace worker for the explicitly mounted Docker workspace.
+tools:
+  - view_file
+  - list_dir
+  - grep_search
+  - find_by_name
+mainAgent: true
+subagent: false
+commandExecutionPolicy: off
+inheritCustomizations: false
+mcpServers: []
+skills: []
+plugins: []
+EOF
+)"
+if [[ "$actual_ro_frontmatter" != "$expected_ro_frontmatter" ]]; then
+  echo 'dedicated RO workspace agent frontmatter differs from the approved capability manifest' >&2
+  diff -u \
+    <(printf '%s\n' "$expected_ro_frontmatter") \
+    <(printf '%s\n' "$actual_ro_frontmatter") >&2 || true
+  failed=1
+fi
+
+actual_rw_frontmatter="$(frontmatter "$rw_agent")"
 expected_rw_frontmatter="$(cat <<'EOF'
 name: agy-bridge-worker-rw-v1
 description: Read-write bridge workspace worker for the explicitly mounted Docker workspace.
@@ -64,6 +95,7 @@ tools:
 mainAgent: true
 subagent: false
 commandExecutionPolicy: off
+inheritCustomizations: false
 mcpServers: []
 skills: []
 plugins: []
