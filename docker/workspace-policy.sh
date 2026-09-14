@@ -46,6 +46,9 @@ assert_workspace_hooks_absent() {
   for plugin_root in /workspace/.agents/plugins /workspace/_agents/plugins; do
     [[ ! -L "$plugin_root" ]] || fail "workspace plugin root must not be a symlink: $plugin_root"
     [[ -d "$plugin_root" ]] || continue
+    if find "$plugin_root" -type l -print -quit | grep -q .; then
+      fail "workspace plugin tree must not contain symlinks: $plugin_root"
+    fi
     if find "$plugin_root" -name hooks.json \( -type f -o -type l \) -print -quit | grep -q .; then
       fail "workspace plugin hooks are not allowed in explicit workspace mode: $plugin_root"
     fi

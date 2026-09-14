@@ -1336,3 +1336,18 @@ serious defect.
   the smallest root-cause fix, and rerun focused plus broad gates.
 - [ ] Run final Deno test/lint/type-check and Docker/verifier gates, review the
   final diff, push normally to `origin`, then prove local and remote HEAD match.
+
+### Audit loop 2: concurrent remote hardening
+
+- [x] Fetch and rebase onto the nine new remote commits without force-pushing
+  or dropping concurrent work.
+- [x] Reproduce the new RED regression in
+  `test-workspace-plugin-agent-collision.sh`: a symlinked plugin directory lets
+  a reserved managed-agent name evade the scanner because `find` does not
+  follow directory symlinks by default.
+- [x] Harden explicit workspace mode to reject any symlink found anywhere in
+  either supported workspace plugin tree before hook/agent discovery proceeds.
+- [x] Re-run the focused plugin-shadow, workspace-hook, and transactional-policy
+  regressions and require PASS.
+- [ ] Re-run the canonical deterministic suite and exact-SHA verifier, then
+  repeat the independent security review on the integrated remote head.
