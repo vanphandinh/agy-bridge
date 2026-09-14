@@ -48,7 +48,6 @@ try {
   }
   Set-Location $root
 
-  # git rev-parse HEAD
   $head = (Invoke-GitCapture -ArgumentList @('rev-parse', 'HEAD') -Quiet).Output.Trim()
   Write-Host "HEAD: $head"
   if ($ExpectedHead -and $head -ne $ExpectedHead) {
@@ -94,13 +93,13 @@ try {
     throw "Frozen main base $BaseRef is not an ancestor of HEAD $head"
   }
 
-  # git diff --name-only
   $changedOutput = (Invoke-GitCapture -ArgumentList @(
     'diff', '--name-only', "$BaseRef..HEAD"
   ) -Quiet).Output
   $changedPaths = @($changedOutput -split '[\r\n]+' | Where-Object { $_ })
   $disallowedPaths = @($changedPaths | Where-Object {
     $_ -ne '.dockerignore' -and
+    $_ -ne '.github/workflows/linux-docker-deterministic.yml' -and
     $_ -ne 'Dockerfile' -and
     $_ -ne 'agy-bridge.ts' -and
     $_ -ne 'compose.workspace-rw.yaml' -and
@@ -117,7 +116,6 @@ try {
     throw "PR4 diff contains disallowed path(s): $($disallowedPaths -join ', ')"
   }
 
-  # git diff --check
   Invoke-GitCapture -ArgumentList @('diff', '--check', "$BaseRef..HEAD") -Quiet | Out-Null
 
   Write-Host 'PASS: PR4 repository identity, merged PR3 ancestry, and changed-path scope'
