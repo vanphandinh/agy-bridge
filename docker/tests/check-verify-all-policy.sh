@@ -58,6 +58,8 @@ required=(
   'RW environment canary exclusion'
   'RW_CONTROL_OK'
   'RW denial probe requires HTTP 200 explicit DENIED evidence'
+  'Workspace denial probe requires HTTP 200 explicit DENIED evidence'
+  'bare workspace probe requires HTTP 200 explicit DENIED evidence'
   'RW Docker control-surface assertions'
   'Workspace exact agy version gate and fixture setup'
   'Workspace read access'
