@@ -132,7 +132,7 @@ try {
   $collision = Join-Path $workspace '.agents\agents\agy-bridge-worker-rw-v1\agent.md'
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $collision) | Out-Null
   Set-Content -LiteralPath $collision -Value 'collision' -NoNewline
-  Assert-StartupRejected -Name 'rw-agent-collision' -Workspace $workspace -Root '/workspace' -Mode 'rw' -MaxConcurrent '1' -WorkspaceMount 'rw' -Expected 'workspace contains reserved agent collision'
+  Assert-StartupRejected -Name 'rw-agent-collision' -Workspace $workspace -Root '/workspace' -Mode 'rw' -MaxConcurrent '1' -WorkspaceMount 'rw' -Expected 'reserved workspace agent collision'
   Remove-Item -Recurse -Force (Join-Path $workspace '.agents')
 
   foreach ($reservedPath in @(
@@ -148,7 +148,7 @@ try {
     docker run --rm --mount "type=bind,src=$workspaceDockerPath,dst=/workspace" agy-bridge:local `
       bash -lc "rm -f '$containerReservedPath'; ln -s /workspace/DOES-NOT-EXIST '$containerReservedPath'"
     if ($LASTEXITCODE -ne 0) { throw "failed to create dangling reserved-agent symlink fixture: $reservedPath" }
-    Assert-StartupRejected -Name ("rw-dangling-agent-collision-" + ($reservedPath -replace '[^a-zA-Z0-9]+', '-')) -Workspace $workspace -Root '/workspace' -Mode 'rw' -MaxConcurrent '1' -WorkspaceMount 'rw' -Expected 'workspace contains reserved agent collision'
+    Assert-StartupRejected -Name ("rw-dangling-agent-collision-" + ($reservedPath -replace '[^a-zA-Z0-9]+', '-')) -Workspace $workspace -Root '/workspace' -Mode 'rw' -MaxConcurrent '1' -WorkspaceMount 'rw' -Expected 'reserved workspace agent collision'
     Remove-Item -Recurse -Force (Join-Path $workspace '.agents')
   }
 
