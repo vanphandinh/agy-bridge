@@ -1378,5 +1378,20 @@ serious defect.
   evidence; require HTTP 200 before the unchanged host fingerprint can count.
 - [x] Re-run focused regressions, all Compose boundary tests, the canonical
   deterministic Docker suite, `deno lint`, and `deno task test`.
-- [ ] Commit the clean candidate, run the exact-SHA non-live verifier, perform
+- [x] Commit the clean candidate, run the exact-SHA non-live verifier, perform
   one final diff review, then synchronize the branch with `origin`.
+
+### Audit loop 5: native tool evidence without narration deltas
+
+- [x] Run live acceptance on the synchronized candidate and reproduce RO
+  containment evidence failing even though the model returned `DENIED`.
+- [x] Inspect the persisted Antigravity transcript and prove the same request
+  invoked native `view_file` while the bridge logged `tool_step_updates: 0`.
+- [x] Root cause the mismatch: bridge accounting incremented the tool counter
+  only when the tool `step_update` also carried a non-empty `text_delta`.
+- [x] Add a RED fake-`agy` regression for a tool step with no narration delta,
+  then count the native tool event independently from optional display text.
+- [x] Re-run the focused bridge regression, deterministic Docker suite,
+  `deno lint`, and full Deno tests (`127 passed`, `0 failed`).
+- [ ] Freeze the new SHA, rerun live acceptance, and synchronize it with
+  `origin` if no further serious defect is found.

@@ -437,6 +437,21 @@ jq -e '
   .tool_step_updates == 1
 ' < <(tail -n 1 "$STATE_DIR/usage.jsonl") >/dev/null || fail "RW usage log did not record exactly one native tool step update"
 
+# Real agy 1.2.2 can emit a native tool step with no narration text_delta.
+# Evidence accounting must count the tool event itself rather than depending on
+# an optional display delta.
+tool_step_no_text_rw="$(curl -fsS \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"FAKE_TOOL_STEP_NO_TEXT"}]}' \
+  http://127.0.0.1:17424/v1/chat/completions)"
+[[ "$tool_step_no_text_rw" == *'fake reply'* ]] || fail "RW no-text tool-step evidence request did not complete"
+jq -e '
+  .autonomous == "rw" and
+  .agent == "agy-bridge-worker-rw-v1" and
+  .tool_step_updates == 1
+' < <(tail -n 1 "$STATE_DIR/usage.jsonl") >/dev/null || fail "RW usage log ignored a native tool step without text_delta"
+
 # A writable RW request can create a workspace-local file after startup. If it
 # plants the reserved managed-agent path, the next request must fail before a
 # second agy child is spawned.

@@ -44,7 +44,9 @@ if [[ "$input" == *'FAKE_HANG'* ]]; then
   exit 1
 fi
 
-if [[ "$input" == *'FAKE_TOOL_STEP'* ]]; then
+if [[ "$input" == *'FAKE_TOOL_STEP_NO_TEXT'* ]]; then
+  printf '%s\n' '{"event":"step_update","step_update":{"step_type":"tool","tool_name":"view_file"}}'
+elif [[ "$input" == *'FAKE_TOOL_STEP'* ]]; then
   printf '%s\n' '{"event":"step_update","step_update":{"step_type":"tool","text_delta":"fake tool activity"}}'
 fi
 

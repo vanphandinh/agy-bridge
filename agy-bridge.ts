@@ -897,6 +897,9 @@ async function runAgy(
         }
         if (ev.event === "step_update") {
           const su = ev.step_update as Record<string, unknown>;
+          if (su.step_type === "tool") {
+            toolStepUpdates++;
+          }
           if (typeof su.text_delta === "string" && su.text_delta !== "") {
             let kind: DeltaKind;
             if (su.step_type === "agent_response") {
@@ -905,7 +908,6 @@ async function runAgy(
               kind = "thought";
             } else if (su.step_type === "tool") {
               kind = "tool";
-              toolStepUpdates++;
             } else {
               kind = "unknown";
               console.error("unknown step_type:", su.step_type, su);
