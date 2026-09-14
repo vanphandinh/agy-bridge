@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - "impl/pr4-read-write-host-workspace"
+      - "tmp/pr9-audit-recovery-20260914"
     paths:
       - "Dockerfile"
       - ".dockerignore"
