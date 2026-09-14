@@ -45,6 +45,7 @@ if grep -nF -- 'run_command' agents/agy-bridge-worker-rw-v1/agent.md; then
 fi
 
 actual_rw_frontmatter="$(awk '
+  { sub(/\r$/, "") }
   NR == 1 && $0 == "---" { in_frontmatter=1; next }
   in_frontmatter && $0 == "---" { exit }
   in_frontmatter { print }
