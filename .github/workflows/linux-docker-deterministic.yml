@@ -113,6 +113,15 @@ jobs:
             -ExpectedHead $env:EXPECTED_HEAD `
             -BaseRef $env:BASE_REF
 
+      - name: Apply PR9 finding 4 staged patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp docker/tests/pr9-finding4.patch /tmp/pr9-finding4.patch
+          git reset --hard 497ef9a08939835a060e0fe58ebb6f428e9a5dda
+          git apply --check /tmp/pr9-finding4.patch
+          git apply /tmp/pr9-finding4.patch
+
       - name: Print Linux, Docker, and commit identity
         shell: bash
         run: |
