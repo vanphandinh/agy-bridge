@@ -117,40 +117,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/pr9-finding4.patch <<'PATCH'
-          diff --git a/docker/tests/fake-agy.sh b/docker/tests/fake-agy.sh
-          --- a/docker/tests/fake-agy.sh
-          +++ b/docker/tests/fake-agy.sh
-          @@ -30,6 +30,10 @@ input="$(cat || true)"
-           printf '%s\n' "$input" > "$capture_file"
-           
-          +if [[ "$input" == *'FAKE_TOOL_STEP'* ]]; then
-          +  printf '%s\n' '{"event":"step_update","step_update":{"step_type":"tool","text_delta":"fake tool activity"}}'
-          +fi
-          +
-           if [[ "$input" == *'FAKE_CREATE_RW_AGENT_COLLISION'* ]]; then
-             mkdir -p /workspace/.agents/agents/agy-bridge-worker-rw-v1
-             printf '%s\n' 'shadow' > /workspace/.agents/agents/agy-bridge-worker-rw-v1/agent.md
-          diff --git a/docker/tests/test-bridge.sh b/docker/tests/test-bridge.sh
-          --- a/docker/tests/test-bridge.sh
-          +++ b/docker/tests/test-bridge.sh
-          @@ -414,10 +414,17 @@ workspace_rw="$(curl -fsS \
-             -H 'content-type: application/json' \
-             -H "Authorization: Bearer $AGY_TOKEN" \
-          -  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"Modify the caller project."}]}' \
-          +  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"FAKE_TOOL_STEP Modify the caller project."}]}' \
-             http://127.0.0.1:17424/v1/chat/completions)"
-           [[ "$workspace_rw" == *'fake reply'* ]] || fail "RW deployment auto-rw reply missing"
-          +latest_usage="$(tail -n 1 "$STATE_DIR/usage.jsonl")"
-          +jq -e '
-          +  .autonomous == "rw" and
-          +  .agent == "agy-bridge-worker-rw-v1" and
-          +  .tool_step_updates == 1
-          +' <<<"$latest_usage" >/dev/null || fail "RW native tool-step evidence missing from usage log"
-           rw_args="$(cat "$HOME/fake-agy-args.txt")"
-           [[ "$rw_args" == *'--agent agy-bridge-worker-rw-v1'* ]] || fail "RW deployment auto-rw did not use reserved RW agent"
-           assert_eq "$(cat "$HOME/fake-agy-cwd.txt")" /workspace
-          PATCH
+          printf '%s' 'ZGlmZiAtLWdpdCBhL2RvY2tlci90ZXN0cy9mYWtlLWFneS5zaCBiL2RvY2tlci90ZXN0cy9mYWtlLWFneS5zaAotLS0gYS9kb2NrZXIvdGVzdHMvZmFrZS1hZ3kuc2gKKysrIGIvZG9ja2VyL3Rlc3RzL2Zha2UtYWd5LnNoCkBAIC0zMCw2ICszMCwxMCBAQCBpbnB1dD0iJChjYXQgfHwgdHJ1ZSkiCiBwcmludGYgJyVzXG4nICIkaW5wdXQiID4gIiRjYXB0dXJlX2ZpbGUiCgoraWYgW1sgIiRpbnB1dCIgPT0gKidGQUtFX1RPT0xfU1RFUCcqIF1dOyB0aGVuCisgIHByaW50ZiAnJXNcbicgJ3siZXZlbnQiOiJzdGVwX3VwZGF0ZSIsInN0ZXBfdXBkYXRlIjp7InN0ZXBfdHlwZSI6InRvb2wiLCJ0ZXh0X2RlbHRhIjoiZmFrZSB0b29sIGFjdGl2aXR5In19JworZmkKKwogaWYgW1sgIiRpbnB1dCIgPT0gKidGQUtFX0NSRUFURV9SV19BR0VOVF9DT0xMSVNJT04nKiBdXTsgdGhlbgogICBta2RpciAtcCAvd29ya3NwYWNlLy5hZ2VudHMvYWdlbnRzL2FneS1icmlkZ2Utd29ya2VyLXJ3LXYxCiAgIHByaW50ZiAnJXNcbicgJ3NoYWRvdycgPiAvd29ya3NwYWNlLy5hZ2VudHMvYWdlbnRzL2FneS1icmlkZ2Utd29ya2VyLXJ3LXYxL2FnZW50Lm1kCmRpZmYgLS1naXQgYS9kb2NrZXIvdGVzdHMvdGVzdC1icmlkZ2Uuc2ggYi9kb2NrZXIvdGVzdHMvdGVzdC1icmlkZ2Uuc2gKLS0tIGEvZG9ja2VyL3Rlc3RzL3Rlc3QtYnJpZGdlLnNoCisrKyBiL2RvY2tlci90ZXN0cy90ZXN0LWJyaWRnZS5zaApAQCAtNDE0LDEwICs0MTQsMTcgQEAgd29ya3NwYWNlX3J3PSIkKGN1cmwgLWZzUyBcCiAgIC1IICdjb250ZW50LXR5cGU6IGFwcGxpY2F0aW9uL2pzb24nIFwKICAgLUggIkF1dGhvcml6YXRpb246IEJlYXJlciAkQUdZX1RPS0VOIiBcCi0gIC1kICd7Im1vZGVsIjoiYXV0by1ydy1nZW1pbmktdGVzdCIsInJlYXNvbmluZ19lZmZvcnQiOiJoaWdoIiwibWVzc2FnZXMiOlt7InJvbGUiOiJ1c2VyIiwiY29udGVudCI6Ik1vZGlmeSB0aGUgY2FsbGVyIHByb2plY3QuIn1dfScgXAorICAtZCAneyJtb2RlbCI6ImF1dG8tcnctZ2VtaW5pLXRlc3QiLCJyZWFzb25pbmdfZWZmb3J0IjoiaGlnaCIsIm1lc3NhZ2VzIjpbeyJyb2xlIjoidXNlciIsImNvbnRlbnQiOiJGQUtFX1RPT0xfU1RFUCBNb2RpZnkgdGhlIGNhbGxlciBwcm9qZWN0LiJ9XX0nIFwKICAgaHR0cDovLzEyNy4wLjAuMToxNzQyNC92MS9jaGF0L2NvbXBsZXRpb25zKSIKIFtbICIkd29ya3NwYWNlX3J3IiA9PSAqJ2Zha2UgcmVwbHknKiBdXSB8fCBmYWlsICJSVyBkZXBsb3ltZW50IGF1dG8tcncgcmVwbHkgbWlzc2luZyIKK2xhdGVzdF91c2FnZT0iJCh0YWlsIC1uIDEgIiRTVEFURV9ESVIvdXNhZ2UuanNvbmwiKSIKK2pxIC1lICcKKyAgLmF1dG9ub21vdXMgPT0gInJ3IiBhbmQKKyAgLmFnZW50ID09ICJhZ3ktYnJpZGdlLXdvcmtlci1ydy12MSIgYW5kCisgIC50b29sX3N0ZXBfdXBkYXRlcyA9PSAxCisnIDw8PCIkbGF0ZXN0X3VzYWdlIiA+L2Rldi9udWxsIHx8IGZhaWwgIlJXIG5hdGl2ZSB0b29sLXN0ZXAgZXZpZGVuY2UgbWlzc2luZyBmcm9tIHVzYWdlIGxvZyIKIHJ3X2FyZ3M9IiQoY2F0ICIkSE9NRS9mYWtlLWFneS1hcmdzLnR4dCIpIgogW1sgIiRyd19hcmdzIiA9PSAqJy0tYWdlbnQgYWd5LWJyaWRnZS13b3JrZXItcnctdjEnKiBdXSB8fCBmYWlsICJSVyBkZXBsb3ltZW50IGF1dG8tcncgZGlkIG5vdCB1c2UgcmVzZXJ2ZWQgUlcgYWdlbnQiCiBhc3NlcnRfZXEgIiQoY2F0ICIkSE9NRS9mYWtlLWFneS1jd2QudHh0IikiIC93b3Jrc3BhY2UK' | base64 -d > /tmp/pr9-finding4.patch
           git reset --hard 497ef9a08939835a060e0fe58ebb6f428e9a5dda
           git apply --check /tmp/pr9-finding4.patch
           git apply /tmp/pr9-finding4.patch
