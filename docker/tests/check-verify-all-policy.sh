@@ -73,6 +73,7 @@ required=(
   'Workspace exact agy version gate and fixture setup'
   'Workspace read access'
   'Workspace host immutability'
+  'workspace mutation probe requires HTTP 200 evidence'
   'Workspace auto-rw denial'
   'Workspace non-workspace canary denial'
   'RO bare-route workspace isolation'
@@ -129,6 +130,11 @@ for needle in "${required[@]}"; do
     exit 1
   }
 done
+
+if grep -F -- '$res.StatusCode -ne 200 -and $res.StatusCode -ne 502' "$file" >/dev/null; then
+  echo 'RO workspace mutation probe must not accept HTTP 502 as immutability evidence' >&2
+  exit 1
+fi
 
 if grep -F -- 'RW reserved-agent shadow denial probe returned unexpected HTTP' "$file" >/dev/null; then
   echo 'RW reserved-agent shadow denial must not accept HTTP 502 as positive containment evidence' >&2

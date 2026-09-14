@@ -382,6 +382,16 @@ create/replace files under `/workspace`; it has no shell-command capability,
 no generic file-delete capability, and no web/MCP/plugin/skill surface. The
 bridge process itself still receives no Deno read/write grant for `/workspace`.
 
+Antigravity `1.2.2` discovers workspace customizations from `.agents`,
+`.agent`, `_agents`, and `_agent`. Explicit workspace startup checks all four
+roots and fails closed on workspace command hooks, unsafe plugin indirection,
+or plugin/direct-agent definitions that shadow the reserved bridge agents.
+The customization roots themselves must be real workspace directories, not
+symlinks; startup rejects a symlinked root before scanning its children.
+Workspace-local `plugins.json` files are rejected because they can redirect or
+inherit plugin discovery outside the standard plugin trees that startup scans.
+This validation applies to both RO and RW workspace deployments.
+
 ### Separate RO/RW `agy` version attestation
 
 RO and RW deployments have independent exact-version files:

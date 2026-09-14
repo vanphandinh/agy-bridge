@@ -1364,3 +1364,19 @@ serious defect.
   reintroducing duplicated production validation.
 - [ ] Run the focused RW Compose boundary, deterministic suite, and exact-SHA
   verifier before the next audit pass.
+
+### Audit loop 4: complete customization roots and verifier evidence
+
+- [x] Reproduce that Antigravity `1.2.2` recognizes `.agent` and `_agent` in
+  addition to `.agents` and `_agents`, leaving hook/plugin/agent validation
+  incomplete when only the plural roots are scanned.
+- [x] Extend reserved-agent, plugin-hook, plugin-agent, and `plugins.json`
+  rejection across all four customization roots with focused regressions.
+- [x] Reproduce an empty symlinked customization root passing the child-path
+  scanners; reject symlinked customization roots before any child discovery.
+- [x] Reproduce the RO immutability verifier accepting HTTP 502 as positive
+  evidence; require HTTP 200 before the unchanged host fingerprint can count.
+- [x] Re-run focused regressions, all Compose boundary tests, the canonical
+  deterministic Docker suite, `deno lint`, and `deno task test`.
+- [ ] Commit the clean candidate, run the exact-SHA non-live verifier, perform
+  one final diff review, then synchronize the branch with `origin`.

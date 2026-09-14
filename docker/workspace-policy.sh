@@ -36,14 +36,34 @@ frontmatter_has_name() {
 }
 
 assert_workspace_hooks_absent() {
-  local hook_path plugin_root
-  for hook_path in /workspace/.agents/hooks.json /workspace/_agents/hooks.json; do
+  local customization_root hook_path plugin_config plugin_root
+  for customization_root in \
+    /workspace/.agents \
+    /workspace/.agent \
+    /workspace/_agents \
+    /workspace/_agent; do
+    [[ ! -L "$customization_root" ]] || fail "workspace customization root must not be a symlink: $customization_root"
+    plugin_config="$customization_root/plugins.json"
+    if [[ -e "$plugin_config" || -L "$plugin_config" ]]; then
+      fail "workspace declared plugin configs are not allowed in explicit workspace mode: $plugin_config"
+    fi
+  done
+
+  for hook_path in \
+    /workspace/.agents/hooks.json \
+    /workspace/.agent/hooks.json \
+    /workspace/_agents/hooks.json \
+    /workspace/_agent/hooks.json; do
     if [[ -e "$hook_path" || -L "$hook_path" ]]; then
       fail "workspace hooks are not allowed in explicit workspace mode: $hook_path"
     fi
   done
 
-  for plugin_root in /workspace/.agents/plugins /workspace/_agents/plugins; do
+  for plugin_root in \
+    /workspace/.agents/plugins \
+    /workspace/.agent/plugins \
+    /workspace/_agents/plugins \
+    /workspace/_agent/plugins; do
     [[ ! -L "$plugin_root" ]] || fail "workspace plugin root must not be a symlink: $plugin_root"
     [[ -d "$plugin_root" ]] || continue
     if find "$plugin_root" -type l -print -quit | grep -q .; then
@@ -63,7 +83,11 @@ assert_plugin_agent_names() {
   fi
 
   local plugin_root agent_file name
-  for plugin_root in /workspace/.agents/plugins /workspace/_agents/plugins; do
+  for plugin_root in \
+    /workspace/.agents/plugins \
+    /workspace/.agent/plugins \
+    /workspace/_agents/plugins \
+    /workspace/_agent/plugins; do
     [[ ! -L "$plugin_root" ]] || fail "workspace plugin root must not be a symlink: $plugin_root"
     [[ -d "$plugin_root" ]] || continue
 
@@ -83,22 +107,22 @@ assert_plugin_agent_names() {
 
 assert_agent_paths() {
   local mode="$1"
-  local paths=(
-    /workspace/.agents/agents/agy-bridge-worker-ro-v1.md
-    /workspace/.agents/agents/agy-bridge-worker-ro-v1/agent.md
-  )
+  local reserved=(agy-bridge-worker-ro-v1)
   if [[ "$mode" == "rw" ]]; then
-    paths+=(
-      /workspace/.agents/agents/agy-bridge-worker-rw-v1.md
-      /workspace/.agents/agents/agy-bridge-worker-rw-v1/agent.md
-    )
+    reserved+=(agy-bridge-worker-rw-v1)
   fi
 
-  local path
-  for path in "${paths[@]}"; do
-    if [[ -e "$path" || -L "$path" ]]; then
-      fail "reserved workspace agent collision: $path"
-    fi
+  local root name path
+  for root in .agents .agent _agents _agent; do
+    for name in "${reserved[@]}"; do
+      for path in \
+        "/workspace/$root/agents/$name.md" \
+        "/workspace/$root/agents/$name/agent.md"; do
+        if [[ -e "$path" || -L "$path" ]]; then
+          fail "reserved workspace agent collision: $path"
+        fi
+      done
+    done
   done
   assert_workspace_hooks_absent
   assert_plugin_agent_names "$mode"
@@ -148,7 +172,19 @@ apply_policy() {
         "write_file(/workspace/.agents/agents/agy-bridge-worker-ro-v1.md)",
         "write_file(/workspace/.agents/agents/agy-bridge-worker-ro-v1/agent.md)",
         "write_file(/workspace/.agents/agents/agy-bridge-worker-rw-v1.md)",
-        "write_file(/workspace/.agents/agents/agy-bridge-worker-rw-v1/agent.md)"
+        "write_file(/workspace/.agents/agents/agy-bridge-worker-rw-v1/agent.md)",
+        "write_file(/workspace/.agent/agents/agy-bridge-worker-ro-v1.md)",
+        "write_file(/workspace/.agent/agents/agy-bridge-worker-ro-v1/agent.md)",
+        "write_file(/workspace/.agent/agents/agy-bridge-worker-rw-v1.md)",
+        "write_file(/workspace/.agent/agents/agy-bridge-worker-rw-v1/agent.md)",
+        "write_file(/workspace/_agents/agents/agy-bridge-worker-ro-v1.md)",
+        "write_file(/workspace/_agents/agents/agy-bridge-worker-ro-v1/agent.md)",
+        "write_file(/workspace/_agents/agents/agy-bridge-worker-rw-v1.md)",
+        "write_file(/workspace/_agents/agents/agy-bridge-worker-rw-v1/agent.md)",
+        "write_file(/workspace/_agent/agents/agy-bridge-worker-ro-v1.md)",
+        "write_file(/workspace/_agent/agents/agy-bridge-worker-ro-v1/agent.md)",
+        "write_file(/workspace/_agent/agents/agy-bridge-worker-rw-v1.md)",
+        "write_file(/workspace/_agent/agents/agy-bridge-worker-rw-v1/agent.md)"
       ]'
       ;;
     *)

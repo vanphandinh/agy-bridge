@@ -153,6 +153,18 @@ jq -e '
     "write_file(/workspace/.agents/agents/agy-bridge-worker-ro-v1/agent.md)",
     "write_file(/workspace/.agents/agents/agy-bridge-worker-rw-v1.md)",
     "write_file(/workspace/.agents/agents/agy-bridge-worker-rw-v1/agent.md)",
+    "write_file(/workspace/.agent/agents/agy-bridge-worker-ro-v1.md)",
+    "write_file(/workspace/.agent/agents/agy-bridge-worker-ro-v1/agent.md)",
+    "write_file(/workspace/.agent/agents/agy-bridge-worker-rw-v1.md)",
+    "write_file(/workspace/.agent/agents/agy-bridge-worker-rw-v1/agent.md)",
+    "write_file(/workspace/_agents/agents/agy-bridge-worker-ro-v1.md)",
+    "write_file(/workspace/_agents/agents/agy-bridge-worker-ro-v1/agent.md)",
+    "write_file(/workspace/_agents/agents/agy-bridge-worker-rw-v1.md)",
+    "write_file(/workspace/_agents/agents/agy-bridge-worker-rw-v1/agent.md)",
+    "write_file(/workspace/_agent/agents/agy-bridge-worker-ro-v1.md)",
+    "write_file(/workspace/_agent/agents/agy-bridge-worker-ro-v1/agent.md)",
+    "write_file(/workspace/_agent/agents/agy-bridge-worker-rw-v1.md)",
+    "write_file(/workspace/_agent/agents/agy-bridge-worker-rw-v1/agent.md)",
     "read_file(/app)",
     "write_file(/app)",
     "read_file(/home/agy/.gemini)",
@@ -202,6 +214,20 @@ if "$helper" assert-agent-paths-rw >/dev/null 2>&1; then
   fail 'assert-agent-paths-rw accepted dangling reserved RW agent symlink'
 fi
 rm -rf /workspace/.agents
+
+mkdir -p /workspace/.agent/agents/agy-bridge-worker-ro-v1
+printf '%s\n' shadow > /workspace/.agent/agents/agy-bridge-worker-ro-v1/agent.md
+if "$helper" assert-agent-paths-ro >/dev/null 2>&1; then
+  fail 'assert-agent-paths-ro accepted singular-dot reserved RO agent collision'
+fi
+rm -rf /workspace/.agent
+
+mkdir -p /workspace/_agent/agents/agy-bridge-worker-rw-v1
+printf '%s\n' shadow > /workspace/_agent/agents/agy-bridge-worker-rw-v1/agent.md
+if "$helper" assert-agent-paths-rw >/dev/null 2>&1; then
+  fail 'assert-agent-paths-rw accepted singular-underscore reserved RW agent collision'
+fi
+rm -rf /workspace/_agent
 
 run_rw_restore_case rw-absent '__ABSENT__'
 run_rw_restore_case rw-present '{"allowNonWorkspaceAccess":true,"trustedWorkspaces":["/old"],"toolPermission":"permissive","permissions":{"allow":["legacy"],"deny":["legacy-deny"]},"unrelated":{"keep":7}}'

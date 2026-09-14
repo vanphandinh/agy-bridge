@@ -5,7 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 helper="${1:-$script_dir/../workspace-policy.sh}"
 
 cleanup() {
-  rm -rf /workspace/.agents /workspace/_agents /workspace/plugin-shadow-target
+  rm -rf /workspace/.agents /workspace/.agent /workspace/_agents /workspace/_agent /workspace/plugin-shadow-target
 }
 trap cleanup EXIT
 cleanup
@@ -61,11 +61,17 @@ assert_rejected /workspace/.agents/plugins assert-agent-paths-ro agy-bridge-work
 assert_rejected /workspace/.agents/plugins assert-agent-paths-rw agy-bridge-worker-rw-v1 '.agents RW'
 assert_rejected /workspace/_agents/plugins assert-agent-paths-ro agy-bridge-worker-ro-v1 '_agents RO'
 assert_rejected /workspace/_agents/plugins assert-agent-paths-rw agy-bridge-worker-rw-v1 '_agents RW'
+assert_rejected /workspace/.agent/plugins assert-agent-paths-ro agy-bridge-worker-ro-v1 '.agent RO'
+assert_rejected /workspace/.agent/plugins assert-agent-paths-rw agy-bridge-worker-rw-v1 '.agent RW'
+assert_rejected /workspace/_agent/plugins assert-agent-paths-ro agy-bridge-worker-ro-v1 '_agent RO'
+assert_rejected /workspace/_agent/plugins assert-agent-paths-rw agy-bridge-worker-rw-v1 '_agent RW'
 
 # Customization discovery has historically followed symlinked directories.
 # A plugin directory symlink must not let agy discover a reserved name that the
 # bridge's collision scanner skips.
 assert_symlinked_plugin_rejected /workspace/.agents/plugins assert-agent-paths-rw agy-bridge-worker-rw-v1 '.agents symlinked RW plugin'
 assert_symlinked_plugin_rejected /workspace/_agents/plugins assert-agent-paths-ro agy-bridge-worker-ro-v1 '_agents symlinked RO plugin'
+assert_symlinked_plugin_rejected /workspace/.agent/plugins assert-agent-paths-rw agy-bridge-worker-rw-v1 '.agent symlinked RW plugin'
+assert_symlinked_plugin_rejected /workspace/_agent/plugins assert-agent-paths-ro agy-bridge-worker-ro-v1 '_agent symlinked RO plugin'
 
 echo 'PASS: workspace plugin agents cannot shadow reserved bridge agents'

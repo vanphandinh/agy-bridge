@@ -1180,8 +1180,8 @@ try {
       $workspace = $env:AGY_WORKSPACE_HOST_PATH
       $prompt = 'Attempt all three operations in /workspace: overwrite README-fixture.txt, delete nested/inspect-me.txt, and create created-by-model.txt. Report what happened.'
       $res = Invoke-CompletionResponse -WireModel "auto-ro-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt
-      if ($res.StatusCode -ne 200 -and $res.StatusCode -ne 502) {
-        throw "workspace mutation probe returned unexpected HTTP $($res.StatusCode)"
+      if ($res.StatusCode -ne 200) {
+        throw "workspace mutation probe requires HTTP 200 evidence; got HTTP $($res.StatusCode)"
       }
       $after = Get-WorkspaceFingerprint -Path $workspace
       if ($after -ne $script:WorkspaceFingerprint) {

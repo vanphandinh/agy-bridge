@@ -139,7 +139,19 @@ try {
     '.agents/agents/agy-bridge-worker-ro-v1.md',
     '.agents/agents/agy-bridge-worker-ro-v1/agent.md',
     '.agents/agents/agy-bridge-worker-rw-v1.md',
-    '.agents/agents/agy-bridge-worker-rw-v1/agent.md'
+    '.agents/agents/agy-bridge-worker-rw-v1/agent.md',
+    '.agent/agents/agy-bridge-worker-ro-v1.md',
+    '.agent/agents/agy-bridge-worker-ro-v1/agent.md',
+    '.agent/agents/agy-bridge-worker-rw-v1.md',
+    '.agent/agents/agy-bridge-worker-rw-v1/agent.md',
+    '_agents/agents/agy-bridge-worker-ro-v1.md',
+    '_agents/agents/agy-bridge-worker-ro-v1/agent.md',
+    '_agents/agents/agy-bridge-worker-rw-v1.md',
+    '_agents/agents/agy-bridge-worker-rw-v1/agent.md',
+    '_agent/agents/agy-bridge-worker-ro-v1.md',
+    '_agent/agents/agy-bridge-worker-ro-v1/agent.md',
+    '_agent/agents/agy-bridge-worker-rw-v1.md',
+    '_agent/agents/agy-bridge-worker-rw-v1/agent.md'
   )) {
     $reservedDir = Split-Path -Parent (Join-Path $workspace ($reservedPath -replace '/', '\'))
     New-Item -ItemType Directory -Force -Path $reservedDir | Out-Null
@@ -149,7 +161,8 @@ try {
       bash -lc "rm -f '$containerReservedPath'; ln -s /workspace/DOES-NOT-EXIST '$containerReservedPath'"
     if ($LASTEXITCODE -ne 0) { throw "failed to create dangling reserved-agent symlink fixture: $reservedPath" }
     Assert-StartupRejected -Name ("rw-dangling-agent-collision-" + ($reservedPath -replace '[^a-zA-Z0-9]+', '-')) -Workspace $workspace -Root '/workspace' -Mode 'rw' -MaxConcurrent '1' -WorkspaceMount 'rw' -Expected 'reserved workspace agent collision'
-    Remove-Item -Recurse -Force (Join-Path $workspace '.agents')
+    $customizationRoot = ($reservedPath -split '/')[0]
+    Remove-Item -Recurse -Force (Join-Path $workspace $customizationRoot)
   }
 
   Assert-StartupRejected -Name 'rw-version-not-verified' -Workspace $workspace -Root '/workspace' -Mode 'rw' -MaxConcurrent '1' -WorkspaceMount 'rw' -AgyBin 'deno' -Expected 'agy 2.9.6 is not verified for explicit read-write host workspace mode'

@@ -288,8 +288,9 @@ Common validation for both workspace modes:
 - `MAX_CONCURRENT` is exactly `1`;
 - `/workspace` exists as a distinct mount;
 - the container root mount is read-only;
-- the relevant reserved managed-agent name is not shadowed by a workspace-local
-  agent file;
+- all Antigravity workspace customization roots (`.agents`, `.agent`,
+  `_agents`, `_agent`) are checked fail-closed for command hooks, unsafe plugin
+  indirection, and reserved managed-agent shadowing;
 - the exact installed `agy` semantic version can be determined;
 - the installed version is present in the mode-specific verified-version file.
 
@@ -434,6 +435,7 @@ tools:
 mainAgent: true
 subagent: false
 commandExecutionPolicy: off
+inheritCustomizations: false
 mcpServers: []
 skills: []
 plugins: []
@@ -455,12 +457,24 @@ The agent has no:
 
 The generic `worker-rw` agent is not reused for explicit host workspace mode.
 
-RW startup fails if the workspace contains either reserved path:
+Antigravity `1.2.2` discovers workspace customizations from `.agents`, `.agent`,
+`_agents`, and `_agent`. RW startup therefore checks every one of those roots.
+For each customization root, startup fails if either reserved form exists for
+the RO or RW managed agent, including dangling symlinks:
 
 ```text
-/workspace/.agents/agents/agy-bridge-worker-rw-v1.md
-/workspace/.agents/agents/agy-bridge-worker-rw-v1/agent.md
+/workspace/<customization-root>/agents/agy-bridge-worker-{ro,rw}-v1.md
+/workspace/<customization-root>/agents/agy-bridge-worker-{ro,rw}-v1/agent.md
 ```
+
+Top-level workspace hooks and plugin-carried hooks are rejected across the same
+four roots, as are plugin trees that can shadow either reserved managed agent.
+Each customization root itself must not be a symlink; validation rejects that
+indirection before inspecting any child hook, plugin, or agent path.
+Workspace-local `plugins.json` is also rejected fail-closed: Antigravity 1.2.2
+allows that file to register or inherit plugin directories outside the standard
+`<customization-root>/plugins` tree, which would otherwise bypass the bridge's
+hook and reserved-agent scanners.
 
 ## 11. Trusted workspace prompt
 
