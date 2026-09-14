@@ -56,29 +56,14 @@ if [[ -n "${AGY_WORKSPACE_ROOT:-}" || -n "${AGY_WORKSPACE_MODE:-}" ]]; then
       *,ro,*) ;;
       *) echo "read-only workspace mount must be read-only" >&2; exit 65 ;;
     esac
+    /app/docker/workspace-policy.sh assert-agent-paths-ro || exit 65
   else
     case ",$mount_options," in
       *,rw,*) ;;
       *) echo "read-write workspace mount must be writable" >&2; exit 65 ;;
     esac
+    /app/docker/workspace-policy.sh assert-agent-paths-rw || exit 65
   fi
-
-  workspace_collisions=(
-    /workspace/.agents/agents/agy-bridge-worker-ro-v1.md \
-    /workspace/.agents/agents/agy-bridge-worker-ro-v1/agent.md
-  )
-  if [[ "$workspace_mode" == "rw" ]]; then
-    workspace_collisions+=(
-      /workspace/.agents/agents/agy-bridge-worker-rw-v1.md
-      /workspace/.agents/agents/agy-bridge-worker-rw-v1/agent.md
-    )
-  fi
-  for collision in "${workspace_collisions[@]}"; do
-    if [[ -e "$collision" || -L "$collision" ]]; then
-      echo "workspace contains reserved agent collision: $collision" >&2
-      exit 65
-    fi
-  done
 
   if [[ "$workspace_mode" == "ro" ]]; then
     verified_versions_file="/app/docker/workspace/verified-agy-versions.txt"
