@@ -12,6 +12,7 @@ tools:
 mainAgent: true
 subagent: false
 commandExecutionPolicy: off
+inheritCustomizations: false
 mcpServers: []
 skills: []
 plugins: []
