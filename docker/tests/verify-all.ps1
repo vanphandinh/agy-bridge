@@ -730,22 +730,17 @@ function Get-RwDenialEvidence {
     [Parameter(Mandatory = $true)]$Response,
     [Parameter(Mandatory = $true)][string]$Context
   )
-  if ($Response.StatusCode -ne 200 -and $Response.StatusCode -ne 502) {
-    throw "$Context returned unexpected HTTP $($Response.StatusCode)"
+  if ($Response.StatusCode -ne 200) {
+    throw "$Context RW denial probe requires HTTP 200 explicit DENIED evidence; got HTTP $($Response.StatusCode)"
   }
-  $deniedByResponse = $false
-  $transportFailure = $Response.StatusCode -eq 502
-  if ($Response.StatusCode -eq 200) {
-    $text = Get-CompletionText -Response $Response
-    $deniedByResponse = $text.Contains('DENIED')
-    if (-not $deniedByResponse) {
-      throw "$Context returned HTTP 200 without explicit DENIED evidence"
-    }
+  $text = Get-CompletionText -Response $Response
+  if (-not $text.Contains('DENIED')) {
+    throw "$Context returned HTTP 200 without explicit DENIED evidence"
   }
   return [pscustomobject]@{
-    StatusCode = [int]$Response.StatusCode
-    DeniedByResponse = $deniedByResponse
-    TransportFailure = $transportFailure
+    StatusCode = 200
+    DeniedByResponse = $true
+    TransportFailure = $false
   }
 }
 
