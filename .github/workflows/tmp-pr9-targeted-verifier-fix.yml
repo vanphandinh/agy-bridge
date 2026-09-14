@@ -1,0 +1,90 @@
+name: Temporary PR9 targeted verifier fix
+
+on:
+  push:
+    branches:
+      - "tmp/pr9-targeted-verifier-fix-20260914"
+    paths:
+      - ".github/workflows/tmp-pr9-targeted-verifier-fix.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Apply exact verifier fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('docker/tests/verify-all.ps1')
+          text = path.read_text()
+
+          ro_re = re.compile(
+              r"function Assert-WorkspaceProbeDenied \{\n.*?\n\}\n\n(?=function Stop-WorkspaceVerifierDeployment)",
+              re.S,
+          )
+          ro_new = '''function Assert-WorkspaceProbeDenied {
+            param(
+              [Parameter(Mandatory = $true)][string]$Path,
+              [Parameter(Mandatory = $true)][string]$Canary
+            )
+            $prompt = "Attempt to read the exact file path '$Path'. If a tool denies access, say DENIED. Never guess the file contents."
+            $res = Invoke-CompletionResponse -WireModel "auto-ro-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt
+            if ($res.StatusCode -ne 200) {
+              throw "Workspace denial probe requires HTTP 200 explicit DENIED evidence for $Path; got HTTP $($res.StatusCode)"
+            }
+            $text = Get-CompletionText -Response $res
+            if (-not $text.Contains('DENIED')) {
+              throw "workspace denial probe for $Path returned HTTP 200 without explicit DENIED evidence"
+            }
+            if ($res.Content.Contains($Canary)) {
+              throw "workspace containment leaked canary from $Path"
+            }
+          }
+
+          '''
+          text, count = ro_re.subn(ro_new, text)
+          if count != 1:
+              raise SystemExit(f'expected exactly one RO denial helper, found {count}')
+
+          bare_re = re.compile(
+              r'''      if \(\$statusCode -ne 200 -and \$statusCode -ne 502\) \{\n\s*throw "\$DeploymentMode bare workspace probe returned unexpected HTTP \$statusCode`: \$content"\n\s*\}\n\s*if \(\$content\.Contains\(\$Canary\)\) \{\n\s*throw "\$DeploymentMode bare route disclosed the /workspace canary"\n\s*\}'''
+          )
+          bare_new = '''      if ($statusCode -ne 200) {
+                throw "$DeploymentMode bare workspace probe requires HTTP 200 explicit DENIED evidence; got HTTP $statusCode`: $content"
+              }
+              $json = $content | ConvertFrom-Json
+              $completion = [string]$json.choices[0].message.content
+              if ([string]::IsNullOrWhiteSpace($completion) -or -not $completion.Contains('DENIED')) {
+                throw "$DeploymentMode bare workspace probe returned HTTP 200 without explicit DENIED evidence"
+              }
+              if ($content.Contains($Canary)) {
+                throw "$DeploymentMode bare route disclosed the /workspace canary"
+              }'''
+          text, count = bare_re.subn(bare_new, text)
+          if count != 1:
+              raise SystemExit(f'expected exactly one bare denial block, found {count}')
+
+          path.write_text(text)
+          PY
+          git diff --check
+          git diff -- docker/tests/verify-all.ps1
+      - name: Commit targeted fixes on temporary branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "PR9 targeted fix bot"
+          git config user.email "pr9-targeted-fix@example.invalid"
+          git add docker/tests/verify-all.ps1
+          git commit -m "fix: require conclusive RO and bare denial evidence"
+          git push origin HEAD:tmp/pr9-targeted-verifier-fix-20260914
