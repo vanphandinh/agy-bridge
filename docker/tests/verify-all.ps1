@@ -644,6 +644,14 @@ function Get-RequestUsageEvidence {
   }
 }
 
+function Test-TerminalEvidenceWithinBudget {
+  param(
+    [Parameter(Mandatory = $true)][long]$ElapsedMs,
+    [Parameter(Mandatory = $true)][int]$TimeoutMs
+  )
+  return $ElapsedMs -le $TimeoutMs
+}
+
 function Wait-RequestTerminalEvidence {
   param(
     [Parameter(Mandatory = $true)][string]$RequestId,
@@ -654,7 +662,12 @@ function Wait-RequestTerminalEvidence {
 
   $watch = [System.Diagnostics.Stopwatch]::StartNew()
   do {
+    # The stabilization timeout is an evidence deadline. A poll that wakes up
+    # after the budget must not accept evidence first observed late. Keep the
+    # boundary inclusive: evidence observed at exactly TimeoutMs is eligible.
+    if (-not (Test-TerminalEvidenceWithinBudget -ElapsedMs $watch.ElapsedMilliseconds -TimeoutMs $TimeoutMs)) { break }
     $evidence = Get-RequestUsageEvidence -RequestId $RequestId -DeploymentMode $DeploymentMode
+    if (-not (Test-TerminalEvidenceWithinBudget -ElapsedMs $watch.ElapsedMilliseconds -TimeoutMs $TimeoutMs)) { break }
     if ($evidence.Found -and ((-not $evidence.ChildStarted) -or $evidence.ChildTerminal)) {
       $watch.Stop()
       Write-Host (
@@ -671,7 +684,9 @@ function Wait-RequestTerminalEvidence {
       return $evidence
     }
     if ($watch.ElapsedMilliseconds -ge $TimeoutMs) { break }
-    Start-Sleep -Milliseconds ([Math]::Max(1, $PollIntervalMs))
+    $remainingMs = [Math]::Max(1, $TimeoutMs - [int]$watch.ElapsedMilliseconds)
+    $sleepMs = [Math]::Min([Math]::Max(1, $PollIntervalMs), $remainingMs)
+    Start-Sleep -Milliseconds $sleepMs
   } while ($true)
 
   $watch.Stop()

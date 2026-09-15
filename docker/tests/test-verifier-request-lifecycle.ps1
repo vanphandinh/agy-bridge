@@ -62,6 +62,7 @@ function Import-VerifierFunction {
   Invoke-Expression $definition
 }
 
+Import-VerifierFunction -Name 'Test-TerminalEvidenceWithinBudget'
 Import-VerifierFunction -Name 'Wait-RequestTerminalEvidence'
 Import-VerifierFunction -Name 'Invoke-CompletionResponse'
 Import-VerifierFunction -Name 'Assert-WorkspaceMutationEvidence'
@@ -92,6 +93,18 @@ $script:CleanupBlocked = $false
 $script:CleanupBlockReason = $null
 $script:ApiBase = 'http://127.0.0.1:1'
 $script:EvidencePoll = 0
+
+# Stabilization uses an inclusive deadline: evidence before or exactly at the
+# budget is eligible; evidence first observed after the budget is late.
+if (-not (Test-TerminalEvidenceWithinBudget -ElapsedMs 9999 -TimeoutMs 10000)) {
+  Fail 'terminal evidence before the stabilization budget was rejected'
+}
+if (-not (Test-TerminalEvidenceWithinBudget -ElapsedMs 10000 -TimeoutMs 10000)) {
+  Fail 'terminal evidence exactly at the stabilization boundary was rejected'
+}
+if (Test-TerminalEvidenceWithinBudget -ElapsedMs 10001 -TimeoutMs 10000) {
+  Fail 'terminal evidence after the stabilization budget was accepted'
+}
 
 # A cancellation can reach the bridge before the child reaches terminal state.
 # The verifier must keep waiting rather than treating cancellation request as
@@ -136,6 +149,139 @@ if ($script:EvidencePoll -lt 3) {
 }
 if ($script:CleanupBlocked) {
   Fail 'terminal evidence unexpectedly blocked cleanup'
+}
+
+# Evidence first observed after the stabilization budget has expired must not
+# be accepted merely because polling woke up late. The timeout is an evidence
+# deadline, not a suggestion for how long to sleep between samples.
+$script:CleanupBlocked = $false
+$script:CleanupBlockReason = $null
+$script:EvidencePoll = 0
+function Get-RequestUsageEvidence {
+  param(
+    [Parameter(Mandatory = $true)][string]$RequestId,
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode
+  )
+  $script:EvidencePoll++
+  if ($script:EvidencePoll -eq 1) {
+    return [pscustomobject]@{
+      Found = $true
+      RequestId = $RequestId
+      ChildStarted = $true
+      ChildTerminal = $false
+      FailureKind = 'aborted'
+    }
+  }
+  return [pscustomobject]@{
+    Found = $true
+    RequestId = $RequestId
+    ChildStarted = $true
+    ChildTerminal = $true
+    FailureKind = 'aborted'
+    ChildExitCode = 143
+    ChildSuccess = $false
+    ChildSignal = 'SIGTERM'
+  }
+}
+
+$lateTerminalRejected = $false
+try {
+  Wait-RequestTerminalEvidence `
+    -RequestId 'verify-terminal-after-budget' `
+    -DeploymentMode ro `
+    -TimeoutMs 20 `
+    -PollIntervalMs 60 | Out-Null
+}
+catch {
+  if ($_.Exception.Message -like '*terminal state remains unknown*') {
+    $lateTerminalRejected = $true
+  }
+  else { throw }
+}
+if (-not $lateTerminalRejected) {
+  Fail 'terminal evidence first observed after the stabilization budget was accepted'
+}
+if (-not $script:CleanupBlocked) {
+  Fail 'late terminal evidence did not block cleanup after the budget expired'
+}
+
+$script:CleanupBlocked = $false
+$script:CleanupBlockReason = $null
+
+# A single evidence fetch can itself cross the stabilization deadline (for
+# example while Docker is slow). Terminal evidence returned only after that
+# fetch completes is also late and must fail closed.
+function Get-RequestUsageEvidence {
+  param(
+    [Parameter(Mandatory = $true)][string]$RequestId,
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode
+  )
+  Start-Sleep -Milliseconds 60
+  return [pscustomobject]@{
+    Found = $true
+    RequestId = $RequestId
+    ChildStarted = $true
+    ChildTerminal = $true
+    FailureKind = 'aborted'
+    ChildExitCode = 143
+    ChildSuccess = $false
+    ChildSignal = 'SIGTERM'
+  }
+}
+
+$slowFetchRejected = $false
+try {
+  Wait-RequestTerminalEvidence `
+    -RequestId 'verify-terminal-slow-fetch' `
+    -DeploymentMode ro `
+    -TimeoutMs 20 `
+    -PollIntervalMs 1 | Out-Null
+}
+catch {
+  if ($_.Exception.Message -like '*terminal state remains unknown*') {
+    $slowFetchRejected = $true
+  }
+  else { throw }
+}
+if (-not $slowFetchRejected) {
+  Fail 'terminal evidence returned by a fetch that crossed the budget was accepted'
+}
+if (-not $script:CleanupBlocked) {
+  Fail 'slow evidence fetch did not block cleanup after crossing the budget'
+}
+
+$script:CleanupBlocked = $false
+$script:CleanupBlockReason = $null
+
+# A correlated request rejected before child spawn is already terminal once
+# its usage evidence exists; it must not wait for an impossible child status.
+function Get-RequestUsageEvidence {
+  param(
+    [Parameter(Mandatory = $true)][string]$RequestId,
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode
+  )
+  return [pscustomobject]@{
+    Found = $true
+    RequestId = $RequestId
+    ChildStarted = $false
+    ChildTerminal = $false
+    FailureKind = 'rejected'
+    ChildExitCode = $null
+    ChildSuccess = $null
+    ChildSignal = $null
+  }
+}
+
+$preSpawn = Wait-RequestTerminalEvidence `
+  -RequestId 'verify-pre-spawn-reject' `
+  -DeploymentMode ro `
+  -TimeoutMs 100 `
+  -PollIntervalMs 1
+if ($preSpawn.ChildStarted -or $preSpawn.FailureKind -ne 'rejected') {
+  Fail 'pre-spawn rejection did not resolve as a no-child terminal request'
+}
+if ($script:CleanupBlocked) {
+  Fail 'pre-spawn rejection incorrectly blocked cleanup waiting for child terminal state'
 }
 
 # Every completion that can spawn agy must carry a correlation id and resolve
