@@ -63,6 +63,7 @@ function Import-VerifierFunction {
 }
 
 Import-VerifierFunction -Name 'Test-TerminalEvidenceWithinBudget'
+Import-VerifierFunction -Name 'Invoke-NativeCapture'
 Import-VerifierFunction -Name 'Wait-RequestTerminalEvidence'
 Import-VerifierFunction -Name 'Invoke-CompletionResponse'
 Import-VerifierFunction -Name 'Assert-WorkspaceMutationEvidence'
@@ -106,13 +107,151 @@ if (Test-TerminalEvidenceWithinBudget -ElapsedMs 10001 -TimeoutMs 10000) {
   Fail 'terminal evidence after the stabilization budget was accepted'
 }
 
+# A native evidence command that never returns must still be bounded by the
+# caller's remaining stabilization budget. The fake console process has no
+# window to close gracefully, so the timeout path must force it terminal and
+# wait for that termination before returning.
+$fakeNativeRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+  'agy verifier bounded native ' + [Guid]::NewGuid().ToString('N')
+)
+New-Item -ItemType Directory -Path $fakeNativeRoot -Force | Out-Null
+$fakeNativeScript = Join-Path $fakeNativeRoot 'hang.ps1'
+$fakeNativePid = Join-Path $fakeNativeRoot 'pid.txt'
+Set-Content -LiteralPath $fakeNativeScript -Encoding ASCII -Value @'
+param([Parameter(Mandatory = $true)][string]$PidFile)
+Set-Content -LiteralPath $PidFile -Encoding ASCII -Value $PID
+Start-Sleep -Seconds 30
+'@
+$hostPowerShell = Join-Path $PSHOME 'powershell.exe'
+$nativeWatch = [System.Diagnostics.Stopwatch]::StartNew()
+try {
+  $capture = Invoke-NativeCapture `
+    -FilePath $hostPowerShell `
+    -ArgumentList @(
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', $fakeNativeScript, '-PidFile', $fakeNativePid
+    ) `
+    -AllowFailure `
+    -Quiet `
+    -TimeoutMs 150 `
+    -TerminationGraceMs 50
+  $nativeWatch.Stop()
+  if (-not $capture.TimedOut) {
+    Fail 'non-returning native evidence command was not reported as timed out'
+  }
+  if (-not $capture.ForcedTermination) {
+    Fail 'native evidence command that ignored graceful stop was not force-terminated'
+  }
+  if ($nativeWatch.ElapsedMilliseconds -gt 1200) {
+    Fail "native evidence timeout exceeded its execution bound: $($nativeWatch.ElapsedMilliseconds)ms"
+  }
+  if (Test-Path -LiteralPath $fakeNativePid) {
+    $fakePid = [int](Get-Content -LiteralPath $fakeNativePid -Raw)
+    if (Get-Process -Id $fakePid -ErrorAction SilentlyContinue) {
+      Fail 'timed-out native evidence process was still running after capture returned'
+    }
+  }
+}
+finally {
+  if (-not $nativeWatch.IsRunning) { }
+  else { $nativeWatch.Stop() }
+  Remove-Item -LiteralPath $fakeNativeRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Wait-RequestTerminalEvidence must pass the remaining wall-clock budget into
+# each evidence fetch so a bounded native capture can enforce the same overall
+# stabilization deadline instead of using an unrelated per-command timeout.
+$script:CapturedEvidenceTimeoutMs = $null
+function Get-RequestUsageEvidence {
+  param(
+    [Parameter(Mandatory = $true)][string]$RequestId,
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode,
+    [int]$TimeoutMs = 0
+  )
+  $script:CapturedEvidenceTimeoutMs = $TimeoutMs
+  return [pscustomobject]@{
+    Found = $true
+    RequestId = $RequestId
+    ChildStarted = $false
+    ChildTerminal = $false
+    FailureKind = 'rejected'
+    ChildExitCode = $null
+    ChildSuccess = $null
+    ChildSignal = $null
+  }
+}
+$remainingBudgetTerminal = Wait-RequestTerminalEvidence `
+  -RequestId 'verify-fetch-remaining-budget' `
+  -DeploymentMode ro `
+  -TimeoutMs 500 `
+  -PollIntervalMs 1
+if ($remainingBudgetTerminal.FailureKind -ne 'rejected') {
+  Fail 'remaining-budget evidence fixture did not resolve terminal state'
+}
+if (
+  $null -eq $script:CapturedEvidenceTimeoutMs -or
+  $script:CapturedEvidenceTimeoutMs -le 0 -or
+  $script:CapturedEvidenceTimeoutMs -gt 500
+) {
+  Fail 'terminal evidence fetch did not receive the remaining stabilization budget'
+}
+
+# Once no wall-clock budget remains, the verifier must fail closed without
+# starting one more evidence command. This keeps the inclusive evidence
+# boundary consistent: evidence that already returned exactly at the deadline
+# is eligible, but a new fetch cannot begin at zero remaining budget.
+$script:CleanupBlocked = $false
+$script:CleanupBlockReason = $null
+$script:EvidencePoll = 0
+function Get-RequestUsageEvidence {
+  param(
+    [Parameter(Mandatory = $true)][string]$RequestId,
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode,
+    [int]$TimeoutMs = 0
+  )
+  $script:EvidencePoll++
+  return [pscustomobject]@{
+    Found = $true
+    RequestId = $RequestId
+    ChildStarted = $false
+    ChildTerminal = $false
+    FailureKind = 'rejected'
+  }
+}
+$zeroBudgetRejected = $false
+try {
+  Wait-RequestTerminalEvidence `
+    -RequestId 'verify-zero-remaining-budget' `
+    -DeploymentMode ro `
+    -TimeoutMs 0 `
+    -PollIntervalMs 1 | Out-Null
+}
+catch {
+  if ($_.Exception.Message -like '*terminal state remains unknown*') {
+    $zeroBudgetRejected = $true
+  }
+  else { throw }
+}
+if (-not $zeroBudgetRejected) {
+  Fail 'zero remaining stabilization budget did not fail closed'
+}
+if ($script:EvidencePoll -ne 0) {
+  Fail 'terminal evidence fetch started despite zero remaining stabilization budget'
+}
+if (-not $script:CleanupBlocked) {
+  Fail 'zero remaining stabilization budget did not block cleanup'
+}
+$script:CleanupBlocked = $false
+$script:CleanupBlockReason = $null
+
 # A cancellation can reach the bridge before the child reaches terminal state.
 # The verifier must keep waiting rather than treating cancellation request as
 # cancellation completion.
 function Get-RequestUsageEvidence {
   param(
     [Parameter(Mandatory = $true)][string]$RequestId,
-    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode,
+    [int]$TimeoutMs = 0
   )
   $script:EvidencePoll++
   if ($script:EvidencePoll -lt 3) {
@@ -160,7 +299,8 @@ $script:EvidencePoll = 0
 function Get-RequestUsageEvidence {
   param(
     [Parameter(Mandatory = $true)][string]$RequestId,
-    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode,
+    [int]$TimeoutMs = 0
   )
   $script:EvidencePoll++
   if ($script:EvidencePoll -eq 1) {
@@ -214,7 +354,8 @@ $script:CleanupBlockReason = $null
 function Get-RequestUsageEvidence {
   param(
     [Parameter(Mandatory = $true)][string]$RequestId,
-    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode,
+    [int]$TimeoutMs = 0
   )
   Start-Sleep -Milliseconds 60
   return [pscustomobject]@{
@@ -253,12 +394,50 @@ if (-not $script:CleanupBlocked) {
 $script:CleanupBlocked = $false
 $script:CleanupBlockReason = $null
 
+# If the evidence command itself fails (including a native process that cannot
+# be terminated cleanly), the verifier must still fail closed and preserve all
+# deployment/fixture state for investigation.
+function Get-RequestUsageEvidence {
+  param(
+    [Parameter(Mandatory = $true)][string]$RequestId,
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode,
+    [int]$TimeoutMs = 0
+  )
+  throw 'synthetic terminal evidence fetch failure'
+}
+$fetchFailureRejected = $false
+try {
+  Wait-RequestTerminalEvidence `
+    -RequestId 'verify-terminal-fetch-failure' `
+    -DeploymentMode ro `
+    -TimeoutMs 100 `
+    -PollIntervalMs 1 | Out-Null
+}
+catch {
+  if ($_.Exception.Message -like '*terminal evidence fetch failed*') {
+    $fetchFailureRejected = $true
+  }
+  elseif ($_.Exception.Message -like '*synthetic terminal evidence fetch failure*') {
+    $fetchFailureRejected = $true
+  }
+  else { throw }
+}
+if (-not $fetchFailureRejected) {
+  Fail 'terminal evidence fetch failure did not stop the verifier'
+}
+if (-not $script:CleanupBlocked) {
+  Fail 'terminal evidence fetch failure did not block cleanup'
+}
+$script:CleanupBlocked = $false
+$script:CleanupBlockReason = $null
+
 # A correlated request rejected before child spawn is already terminal once
 # its usage evidence exists; it must not wait for an impossible child status.
 function Get-RequestUsageEvidence {
   param(
     [Parameter(Mandatory = $true)][string]$RequestId,
-    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode,
+    [int]$TimeoutMs = 0
   )
   return [pscustomobject]@{
     Found = $true
@@ -307,7 +486,8 @@ function Invoke-Http {
 function Get-RequestUsageEvidence {
   param(
     [Parameter(Mandatory = $true)][string]$RequestId,
-    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode,
+    [int]$TimeoutMs = 0
   )
   return [pscustomobject]@{
     Found = $true
@@ -398,7 +578,8 @@ if (-not $mutationRejected) {
 function Get-RequestUsageEvidence {
   param(
     [Parameter(Mandatory = $true)][string]$RequestId,
-    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode,
+    [int]$TimeoutMs = 0
   )
   return [pscustomobject]@{
     Found = $false

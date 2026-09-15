@@ -86,8 +86,160 @@ function Invoke-NativeCapture {
     [Parameter(Mandatory = $true)][string]$FilePath,
     [string[]]$ArgumentList = @(),
     [switch]$AllowFailure,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [int]$TimeoutMs = 0,
+    [int]$TerminationGraceMs = 100
   )
+
+  if ($TimeoutMs -gt 0) {
+    $runner = @'
+$ErrorActionPreference = 'Continue'
+$payloadJson = [System.Text.Encoding]::UTF8.GetString(
+  [Convert]::FromBase64String($env:AGY_VERIFY_NATIVE_PAYLOAD_B64)
+)
+$payload = $payloadJson | ConvertFrom-Json
+$nativeArgs = @($payload.ArgumentList | ForEach-Object { [string]$_ })
+$lines = @(& ([string]$payload.FilePath) @nativeArgs 2>&1)
+$exitCode = $LASTEXITCODE
+foreach ($line in $lines) {
+  [Console]::Out.WriteLine([string]$line)
+}
+if ($null -eq $exitCode) { exit 1 }
+exit [int]$exitCode
+'@
+    $payloadJson = @{
+      FilePath = $FilePath
+      ArgumentList = @($ArgumentList)
+    } | ConvertTo-Json -Compress
+    $payloadB64 = [Convert]::ToBase64String(
+      [System.Text.Encoding]::UTF8.GetBytes($payloadJson)
+    )
+    $encodedRunner = [Convert]::ToBase64String(
+      [System.Text.Encoding]::Unicode.GetBytes($runner)
+    )
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = Join-Path $PSHOME 'powershell.exe'
+    $startInfo.Arguments =
+      "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedRunner"
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+    $startInfo.EnvironmentVariables['AGY_VERIFY_NATIVE_PAYLOAD_B64'] = $payloadB64
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $forcedTermination = $false
+    $timedOut = $false
+    $stdout = ''
+    $stderr = ''
+    $budgetWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+      if (-not $process.Start()) {
+        throw "$FilePath failed to start"
+      }
+      $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+      $stderrTask = $process.StandardError.ReadToEndAsync()
+
+      $remainingAfterStartMs = [Math]::Max(
+        0,
+        $TimeoutMs - [int]$budgetWatch.ElapsedMilliseconds
+      )
+      $terminationBudgetMs = [Math]::Min(
+        [Math]::Max(0, $TerminationGraceMs),
+        [Math]::Max(0, $remainingAfterStartMs - 1)
+      )
+      $executionBudgetMs = [Math]::Max(0, $remainingAfterStartMs - $terminationBudgetMs)
+      if ($executionBudgetMs -le 0 -or -not $process.WaitForExit($executionBudgetMs)) {
+        $timedOut = $true
+        try { [void]$process.CloseMainWindow() } catch { }
+        if (-not $process.HasExited) {
+          $forcedTermination = $true
+          $taskkillInfo = [System.Diagnostics.ProcessStartInfo]::new()
+          $taskkillInfo.FileName = 'taskkill.exe'
+          $taskkillInfo.Arguments = "/PID $($process.Id) /T /F"
+          $taskkillInfo.UseShellExecute = $false
+          $taskkillInfo.CreateNoWindow = $true
+          $taskkillInfo.RedirectStandardOutput = $true
+          $taskkillInfo.RedirectStandardError = $true
+          $taskkill = [System.Diagnostics.Process]::new()
+          $taskkill.StartInfo = $taskkillInfo
+          $taskkillStarted = $false
+          try {
+            $taskkillStarted = $taskkill.Start()
+            $remainingTerminationMs = [Math]::Max(
+              0,
+              $TimeoutMs - [int]$budgetWatch.ElapsedMilliseconds
+            )
+            if ($taskkillStarted -and $remainingTerminationMs -gt 0) {
+              [void]$taskkill.WaitForExit($remainingTerminationMs)
+            }
+          }
+          catch { }
+          finally {
+            if ($taskkillStarted -and -not $taskkill.HasExited) {
+              try { $taskkill.Kill() } catch { }
+            }
+            $taskkill.Dispose()
+          }
+          if (-not $process.HasExited) {
+            try { $process.Kill() } catch { }
+          }
+          $remainingTerminationMs = [Math]::Max(
+            0,
+            $TimeoutMs - [int]$budgetWatch.ElapsedMilliseconds
+          )
+          if (-not $process.HasExited -and $remainingTerminationMs -gt 0) {
+            [void]$process.WaitForExit($remainingTerminationMs)
+          }
+        }
+      }
+      $budgetWatch.Stop()
+
+      if ($process.HasExited) {
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+      }
+      $textParts = @(
+        @($stdout.TrimEnd(), $stderr.TrimEnd()) |
+          Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+          ForEach-Object { [string]$_ }
+      )
+      $text = $textParts -join [Environment]::NewLine
+      if (-not $Quiet -and $text) {
+        Write-Host $text
+      }
+
+      if ($timedOut) {
+        if (-not $process.HasExited) {
+          throw "$FilePath timed out after ${TimeoutMs}ms and did not terminate"
+        }
+        if (-not $AllowFailure) {
+          throw "$FilePath timed out after ${TimeoutMs}ms"
+        }
+        return [pscustomobject]@{
+          ExitCode = $null
+          Output = $text
+          TimedOut = $true
+          ForcedTermination = $forcedTermination
+        }
+      }
+
+      $exitCode = $process.ExitCode
+      if ($exitCode -ne 0 -and -not $AllowFailure) {
+        throw "$FilePath $($ArgumentList -join ' ') failed with exit code $exitCode`n$text"
+      }
+      return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = $text
+        TimedOut = $false
+        ForcedTermination = $false
+      }
+    }
+    finally {
+      $process.Dispose()
+    }
+  }
 
   # Windows PowerShell 5.1 can promote redirected native stderr records to
   # terminating errors when ErrorActionPreference is Stop. Docker/BuildKit
@@ -120,9 +272,17 @@ function Invoke-DockerCapture {
   param(
     [string[]]$ArgumentList = @(),
     [switch]$AllowFailure,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [int]$TimeoutMs = 0,
+    [int]$TerminationGraceMs = 100
   )
-  return Invoke-NativeCapture -FilePath 'docker' -ArgumentList $ArgumentList -AllowFailure:$AllowFailure -Quiet:$Quiet
+  return Invoke-NativeCapture `
+    -FilePath 'docker' `
+    -ArgumentList $ArgumentList `
+    -AllowFailure:$AllowFailure `
+    -Quiet:$Quiet `
+    -TimeoutMs $TimeoutMs `
+    -TerminationGraceMs $TerminationGraceMs
 }
 
 function Invoke-Http {
@@ -563,16 +723,22 @@ function Invoke-WorkspaceDockerCapture {
   param(
     [string[]]$ArgumentList = @(),
     [switch]$AllowFailure,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [int]$TimeoutMs = 0
   )
   $prefix = @(Get-WorkspaceComposeArgs)
-  return Invoke-DockerCapture -ArgumentList @($prefix + $ArgumentList) -AllowFailure:$AllowFailure -Quiet:$Quiet
+  return Invoke-DockerCapture `
+    -ArgumentList @($prefix + $ArgumentList) `
+    -AllowFailure:$AllowFailure `
+    -Quiet:$Quiet `
+    -TimeoutMs $TimeoutMs
 }
 
 function Get-RequestUsageEvidence {
   param(
     [Parameter(Mandatory = $true)][string]$RequestId,
-    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode,
+    [int]$TimeoutMs = 0
   )
 
   $tailArgs = @(
@@ -581,14 +747,26 @@ function Get-RequestUsageEvidence {
     '/home/agy/.local/state/agy-bridge/usage.jsonl'
   )
   if ($DeploymentMode -eq 'ro') {
-    $capture = Invoke-WorkspaceDockerCapture -ArgumentList $tailArgs -AllowFailure -Quiet
+    $capture = Invoke-WorkspaceDockerCapture `
+      -ArgumentList $tailArgs `
+      -AllowFailure `
+      -Quiet `
+      -TimeoutMs $TimeoutMs
   }
   elseif ($DeploymentMode -eq 'rw') {
-    $capture = Invoke-WorkspaceRwDockerCapture -ArgumentList $tailArgs -AllowFailure -Quiet
+    $capture = Invoke-WorkspaceRwDockerCapture `
+      -ArgumentList $tailArgs `
+      -AllowFailure `
+      -Quiet `
+      -TimeoutMs $TimeoutMs
   }
   else {
     $captureArgs = @('compose') + $tailArgs
-    $capture = Invoke-DockerCapture -ArgumentList $captureArgs -AllowFailure -Quiet
+    $capture = Invoke-DockerCapture `
+      -ArgumentList $captureArgs `
+      -AllowFailure `
+      -Quiet `
+      -TimeoutMs $TimeoutMs
   }
   if ($capture.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($capture.Output)) {
     return [pscustomobject]@{
@@ -666,7 +844,20 @@ function Wait-RequestTerminalEvidence {
     # after the budget must not accept evidence first observed late. Keep the
     # boundary inclusive: evidence observed at exactly TimeoutMs is eligible.
     if (-not (Test-TerminalEvidenceWithinBudget -ElapsedMs $watch.ElapsedMilliseconds -TimeoutMs $TimeoutMs)) { break }
-    $evidence = Get-RequestUsageEvidence -RequestId $RequestId -DeploymentMode $DeploymentMode
+    $remainingMs = $TimeoutMs - [int]$watch.ElapsedMilliseconds
+    if ($remainingMs -le 0) { break }
+    try {
+      $evidence = Get-RequestUsageEvidence `
+        -RequestId $RequestId `
+        -DeploymentMode $DeploymentMode `
+        -TimeoutMs $remainingMs
+    }
+    catch {
+      $script:CleanupBlocked = $true
+      $script:CleanupBlockReason =
+        "request $RequestId terminal evidence fetch failed; refusing cleanup or further gates"
+      throw "$($script:CleanupBlockReason): $($_.Exception.Message)"
+    }
     if (-not (Test-TerminalEvidenceWithinBudget -ElapsedMs $watch.ElapsedMilliseconds -TimeoutMs $TimeoutMs)) { break }
     if ($evidence.Found -and ((-not $evidence.ChildStarted) -or $evidence.ChildTerminal)) {
       $watch.Stop()
@@ -868,10 +1059,15 @@ function Invoke-WorkspaceRwDockerCapture {
   param(
     [string[]]$ArgumentList = @(),
     [switch]$AllowFailure,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [int]$TimeoutMs = 0
   )
   $prefix = @(Get-WorkspaceRwComposeArgs)
-  return Invoke-DockerCapture -ArgumentList @($prefix + $ArgumentList) -AllowFailure:$AllowFailure -Quiet:$Quiet
+  return Invoke-DockerCapture `
+    -ArgumentList @($prefix + $ArgumentList) `
+    -AllowFailure:$AllowFailure `
+    -Quiet:$Quiet `
+    -TimeoutMs $TimeoutMs
 }
 
 function ConvertTo-ShellSingleQuoted {
