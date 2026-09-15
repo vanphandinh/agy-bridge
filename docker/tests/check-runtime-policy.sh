@@ -19,6 +19,10 @@ grep -F 'sha512sum -c -' "$dockerfile" >/dev/null || {
   echo 'agy artifact checksum is not verified before install' >&2
   exit 1
 }
+grep -F 'ENV AGY_CLI_DISABLE_AUTO_UPDATE=true' "$dockerfile" >/dev/null || {
+  echo 'agy auto-update must be disabled so the pinned runtime binary cannot drift' >&2
+  exit 1
+}
 if grep -E 'curl[^|\r\n]*\|[^\r\n]*(ba)?sh' "$dockerfile" >/dev/null; then
   echo 'unchecked curl pipe to shell is forbidden' >&2
   exit 1
