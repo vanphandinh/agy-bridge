@@ -55,7 +55,7 @@ const STATE_DIR = Deno.env.get("STATE_DIR") ??
   `${Deno.env.get("HOME")}/.local/state/agy-bridge`;
 const USAGE_LOG = `${STATE_DIR}/usage.jsonl`;
 
-type WorkspaceMode = "ro";
+type WorkspaceMode = "ro" | "rw";
 
 interface WorkspaceConfig {
   root: "/workspace";
@@ -69,8 +69,8 @@ function loadWorkspaceConfig(): WorkspaceConfig | null {
   if (root !== "/workspace") {
     throw new Error("AGY_WORKSPACE_ROOT must be /workspace");
   }
-  if (mode !== "ro") {
-    throw new Error("AGY_WORKSPACE_MODE must be ro");
+  if (mode !== "ro" && mode !== "rw") {
+    throw new Error("AGY_WORKSPACE_MODE must be ro or rw");
   }
   if (MAX_CONCURRENT !== 1) {
     throw new Error("workspace mode requires MAX_CONCURRENT=1");
@@ -79,15 +79,23 @@ function loadWorkspaceConfig(): WorkspaceConfig | null {
 }
 
 const WORKSPACE = loadWorkspaceConfig();
-const WORKSPACE_AGENT = "agy-bridge-worker-ro-v1";
+const WORKSPACE_RO_AGENT = "agy-bridge-worker-ro-v1";
+const WORKSPACE_RW_AGENT = "agy-bridge-worker-rw-v1";
 const WORKSPACE_POLICY_HELPER = "/app/docker/workspace-policy.sh";
-const WORKSPACE_CONTRACT = `# Bridge workspace contract
+const WORKSPACE_RO_CONTRACT = `# Bridge workspace contract
 
 The operator explicitly exposed one caller project at /workspace in read-only mode.
 Treat /workspace as the caller project root.
 Do not treat /app, HOME, the bridge process directory, bridge state, configuration, keyring data, or secrets as caller project files.
 Use project filesystem tools only within /workspace.
 The workspace is read-only. Never create, modify, delete, or execute project files.`;
+const WORKSPACE_RW_CONTRACT = `# Bridge workspace contract
+
+The operator explicitly exposed one caller project at /workspace in read-write mode.
+Treat /workspace as the only caller project root.
+Do not treat /app, HOME, the bridge process directory, bridge state, configuration, keyring data, or secrets as caller project files.
+You may read, create, and replace project file contents only within /workspace.
+This agent has no shell-command capability and no generic file-delete capability.`;
 
 // ---------- autonomous delegation (models prefixed "auto-<profile>-") ----------
 //
@@ -209,6 +217,35 @@ async function appendUsage(entry: Record<string, unknown>) {
   } catch (e) {
     console.error("usage log write failed:", e);
   }
+}
+
+const REQUEST_CORRELATION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+function requestCorrelationLog(req: Request): Record<string, string> {
+  const requestId = req.headers.get("x-agy-request-id");
+  if (requestId && REQUEST_CORRELATION_PATTERN.test(requestId)) {
+    return { request_id: requestId };
+  }
+  return {};
+}
+
+async function rejectBeforeChild(
+  req: Request,
+  status: number,
+  message: string,
+): Promise<Response> {
+  const correlation = requestCorrelationLog(req);
+  if (correlation.request_id) {
+    await appendUsage({
+      ok: false,
+      error: message,
+      failure_kind: "rejected",
+      child_started: false,
+      child_terminal: false,
+      ...correlation,
+    });
+  }
+  return jsonError(status, message);
 }
 
 // ---------- concurrency gate ----------
@@ -671,12 +708,32 @@ interface AgyStreamHandlers {
   evict?: () => void;
 }
 
-interface AgyExecutionContext {
-  cwd?: string;
-  workspaceReadOnly?: boolean;
+type WorkspaceAccess = "none" | WorkspaceMode;
+
+interface WorkspaceExecution {
+  root: "/workspace";
+  access: WorkspaceAccess;
 }
 
-async function runWorkspacePolicy(action: "apply-ro" | "restore"): Promise<void> {
+interface AgyExecutionContext {
+  workspace?: WorkspaceExecution;
+}
+
+type WorkspacePolicyAction =
+  | "assert-agent-paths-ro"
+  | "assert-agent-paths-rw"
+  | "apply-none"
+  | "apply-ro"
+  | "apply-rw"
+  | "restore";
+
+function bareExecutionContext(): AgyExecutionContext {
+  return WORKSPACE
+    ? { workspace: { root: WORKSPACE.root, access: "none" } }
+    : {};
+}
+
+async function runWorkspacePolicy(action: WorkspacePolicyAction): Promise<void> {
   const child = new Deno.Command(WORKSPACE_POLICY_HELPER, {
     args: [action],
     stdout: "piped",
@@ -713,12 +770,32 @@ async function runAgy(
   let onAbort: (() => void) | null = null;
   let abortListenerAdded = false;
   let workspacePolicyApplied = false;
-  let workspaceChildStatus: Promise<Deno.CommandStatus> | null = null;
-  let workspaceChildKill: (() => void) | null = null;
+  let childStatusForCleanup: Promise<Deno.CommandStatus> | null = null;
+  let childKillForCleanup: (() => void) | null = null;
+  let childStarted = false;
+  let childTerminalStatus: Deno.CommandStatus | null = null;
+  let toolStepUpdates = 0;
+  const workspace = execution.workspace;
 
   try {
-    if (execution.workspaceReadOnly) {
-      await runWorkspacePolicy("apply-ro");
+    if (workspace) {
+      if (workspace.access === "none") {
+        await runWorkspacePolicy("apply-none");
+      } else {
+        try {
+          await runWorkspacePolicy(
+            workspace.access === "ro" ? "assert-agent-paths-ro" : "assert-agent-paths-rw",
+          );
+        } catch (e) {
+          result.error = e instanceof Error ? e.message : String(e);
+          return result;
+        }
+      }
+      if (workspace.access === "ro") {
+        await runWorkspacePolicy("apply-ro");
+      } else if (workspace.access === "rw") {
+        await runWorkspacePolicy("apply-rw");
+      }
       workspacePolicyApplied = true;
     }
     const args = [
@@ -739,17 +816,20 @@ async function runAgy(
       stdout: "piped",
       stderr: "piped",
       stdin: "piped",
-      cwd: execution.cwd,
-      env: execution.workspaceReadOnly ? workspaceChildEnv() : childEnv(),
+      cwd: workspace?.access === "ro" || workspace?.access === "rw"
+        ? workspace.root
+        : undefined,
+      env: workspace ? workspaceChildEnv() : childEnv(),
       clearEnv: true,
     }).spawn();
+    childStarted = true;
 
     // Start draining and arm termination machinery before any child I/O can
     // block. In particular, a multi-megabyte stdin write can fill the pipe if
     // agy keeps stdin open but never reads it.
     const stderrText = new Response(child.stderr).text().catch(() => "");
     const statusPromise = child.status;
-    if (execution.workspaceReadOnly) workspaceChildStatus = statusPromise;
+    childStatusForCleanup = statusPromise;
     let exited = false;
     let escalateTimer: ReturnType<typeof setTimeout> | null = null;
     const clearEscalation = () => {
@@ -759,7 +839,13 @@ async function runAgy(
         escalateTimer = null;
       }
     };
-    void statusPromise.then(clearEscalation, clearEscalation);
+    void statusPromise.then(
+      (status) => {
+        childTerminalStatus = status;
+        clearEscalation();
+      },
+      clearEscalation,
+    );
 
     const killHard = () => {
       if (exited) return;
@@ -767,9 +853,9 @@ async function runAgy(
         child.kill("SIGTERM");
       } catch { /* already dead */ }
       if (escalateTimer === null) {
-        // Default runs may release their request gate before this escalation.
-        // Workspace runs wait for child.status before restoring policy and
-        // releasing the concurrency slot.
+        // Every run now waits for child.status before releasing the
+        // concurrency slot; workspace runs additionally restore policy only
+        // after that same terminal-state barrier.
         escalateTimer = setTimeout(() => {
           if (!exited) {
             try {
@@ -779,7 +865,7 @@ async function runAgy(
         }, 3_000);
       }
     };
-    if (execution.workspaceReadOnly) workspaceChildKill = killHard;
+    childKillForCleanup = killHard;
 
     let resolveAbort: ((value: "aborted") => void) | null = null;
     const abortPromise = signal
@@ -849,6 +935,9 @@ async function runAgy(
         }
         if (ev.event === "step_update") {
           const su = ev.step_update as Record<string, unknown>;
+          if (su.step_type === "tool") {
+            toolStepUpdates++;
+          }
           if (typeof su.text_delta === "string" && su.text_delta !== "") {
             let kind: DeltaKind;
             if (su.step_type === "agent_response") {
@@ -876,6 +965,7 @@ async function runAgy(
         }
       }
       const status = await statusPromise;
+      childTerminalStatus = status;
       if (!terminalEarly && !result.ok && !result.error) {
         const errText = await stderrText;
         result.error = errText.trim() || `agy exited with code ${status.code}`;
@@ -949,13 +1039,13 @@ async function runAgy(
     if (signal && onAbort && abortListenerAdded) {
       signal.removeEventListener("abort", onAbort);
     }
-    if (workspacePolicyApplied && workspaceChildStatus) {
-      workspaceChildKill?.();
+    if (childStatusForCleanup) {
+      childKillForCleanup?.();
       try {
-        await workspaceChildStatus;
+        childTerminalStatus = await childStatusForCleanup;
       } catch {
-        // The containment invariant needs terminal process state, not a
-        // successful exit code. runAgy records the actual request failure.
+        // Cleanup needs terminal process state, not a successful exit code.
+        // runAgy records the actual request failure independently.
       }
     }
     if (workspacePolicyApplied) {
@@ -979,6 +1069,17 @@ async function runAgy(
       conversation_id: result.conversationId,
       tokens: result.usage,
       error: result.error,
+      failure_kind: result.failureKind,
+      child_started: childStarted,
+      child_terminal: childTerminalStatus !== null,
+      ...(childTerminalStatus
+        ? {
+          child_success: childTerminalStatus.success,
+          child_exit_code: childTerminalStatus.code,
+          child_signal: childTerminalStatus.signal,
+        }
+        : {}),
+      tool_step_updates: toolStepUpdates,
       ...(recoveredSalvage ? { recovered: true } : {}),
       ...(handlers.log ?? {}),
     });
@@ -1049,20 +1150,34 @@ async function handleAutonomousChat(
   modelStr: string,
   auto: AutoRoute,
 ): Promise<Response> {
-  const workspaceReadOnly = WORKSPACE !== null && auto.profile === "ro";
-  const selectedAgent = workspaceReadOnly ? WORKSPACE_AGENT : auto.agent;
-  const execution: AgyExecutionContext = workspaceReadOnly
-    ? { cwd: WORKSPACE.root, workspaceReadOnly: true }
-    : {};
+  const workspace: WorkspaceExecution | undefined = WORKSPACE === null
+    ? undefined
+    : auto.profile === "ro"
+    ? { root: WORKSPACE.root, access: "ro" }
+    : auto.profile === "rw" && WORKSPACE.mode === "rw"
+    ? { root: WORKSPACE.root, access: "rw" }
+    : undefined;
+  const selectedAgent = workspace?.access === "ro"
+    ? WORKSPACE_RO_AGENT
+    : workspace?.access === "rw"
+    ? WORKSPACE_RW_AGENT
+    : auto.agent;
+  const execution: AgyExecutionContext = workspace ? { workspace } : {};
+  const workspaceContract = workspace?.access === "ro"
+    ? WORKSPACE_RO_CONTRACT
+    : workspace?.access === "rw"
+    ? WORKSPACE_RW_CONTRACT
+    : undefined;
   const prepared = renderAutonomousPrompt(
     body,
-    workspaceReadOnly ? WORKSPACE_CONTRACT : undefined,
+    workspaceContract,
   );
   const log = {
+    ...requestCorrelationLog(req),
     autonomous: auto.profile,
     agent: selectedAgent,
-    ...(workspaceReadOnly
-      ? { workspace_enabled: true, workspace_mode: "ro", workspace_root: "/workspace" }
+    ...(workspace
+      ? { workspace_enabled: true, workspace_mode: workspace.access, workspace_root: workspace.root }
       : {}),
     msgs: body.messages?.length ?? 0,
     prompt_chars: prepared.prompt.length,
@@ -1190,18 +1305,24 @@ function accessGuard(req: Request): Response | null {
 }
 
 async function handleChat(req: Request): Promise<Response> {
+  const requestId = req.headers.get("x-agy-request-id");
+  if (requestId && !REQUEST_CORRELATION_PATTERN.test(requestId)) {
+    return jsonError(400, "invalid request correlation id");
+  }
+
   let body: OAIChatRequest;
   try {
     body = await req.json();
   } catch {
-    return jsonError(400, "invalid JSON body");
+    return rejectBeforeChild(req, 400, "invalid JSON body");
   }
   const model = String(body.model ?? "");
-  if (!model) return jsonError(400, "missing model");
+  if (!model) return rejectBeforeChild(req, 400, "missing model");
   const auto = parseAutoModel(model);
   if (auto) {
-    if (WORKSPACE && auto.profile === "rw") {
-      return jsonError(
+    if (WORKSPACE?.mode === "ro" && auto.profile === "rw") {
+      return rejectBeforeChild(
+        req,
         403,
         "workspace is read-only; read-write host workspace support is not enabled",
       );
@@ -1211,14 +1332,15 @@ async function handleChat(req: Request): Promise<Response> {
     // reasoning.effort, variant) funnel through variantSignals; the slug
     // suffix is parsed inside resolveWireModel from the wire model itself.
     const resolved = resolveWireModel(model, variantSignals(body), declared);
-    if (!resolved.ok) return jsonError(400, resolved.message);
+    if (!resolved.ok) return rejectBeforeChild(req, 400, resolved.message);
     return handleAutonomousChat(req, body, model, {
       ...auto,
       real: resolved.slug,
     });
   }
   if (!modelSlugs.includes(model)) {
-    return jsonError(
+    return rejectBeforeChild(
+      req,
       400,
       `unknown model "${model}"; available: ${modelSlugs.join(", ")}`,
     );
@@ -1227,7 +1349,9 @@ async function handleChat(req: Request): Promise<Response> {
   const prepared = await preparePrompt(body, model);
   const { prompt } = prepared;
   const useTools = TOOLS_ENABLED && (body.tools?.length ?? 0) > 0;
+  const bareExecution = bareExecutionContext();
   const log = {
+    ...requestCorrelationLog(req),
     continued: prepared.continued,
     msgs: body.messages?.length ?? 0,
     prompt_chars: prompt.length,
@@ -1247,6 +1371,8 @@ async function handleChat(req: Request): Promise<Response> {
       { log, commit: prepared.commit, evict: prepared.evict },
       req.signal,
       prepared.conversationId,
+      AGY_AGENT,
+      bareExecution,
     );
     if (
       !r.ok && prepared.continued && r.failureKind === "natural"
@@ -1260,7 +1386,7 @@ async function handleChat(req: Request): Promise<Response> {
       r = await runAgy(model, fresh.prompt, {
         log: { ...log, continued: false },
         commit: fresh.commit,
-      }, req.signal);
+      }, req.signal, undefined, AGY_AGENT, bareExecution);
     }
     if (!r.ok) return jsonError(502, r.error ?? "agy failed");
     if (useTools) {
@@ -1341,6 +1467,8 @@ async function handleChat(req: Request): Promise<Response> {
             },
             req.signal,
             prepared.conversationId,
+            AGY_AGENT,
+            bareExecution,
           );
           classifier.flush();
           if (!r.ok) {
@@ -1365,7 +1493,7 @@ async function handleChat(req: Request): Promise<Response> {
             log,
             commit: prepared.commit,
             evict: prepared.evict,
-          }, req.signal, prepared.conversationId);
+          }, req.signal, prepared.conversationId, AGY_AGENT, bareExecution);
           classifier.flush();
           if (!r.ok) {
             send({ error: { message: r.error ?? "agy failed", code: 502 } });
@@ -1405,7 +1533,25 @@ Deno.serve({ port: PORT, hostname: HOSTNAME }, async (req) => {
     return Response.json({ ok: true });
   }
   const denied = accessGuard(req);
-  if (denied) return denied;
+  if (denied) {
+    if (
+      req.method === "POST" &&
+      (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")
+    ) {
+      const correlation = requestCorrelationLog(req);
+      if (correlation.request_id) {
+        await appendUsage({
+          ok: false,
+          error: `request rejected before child spawn (HTTP ${denied.status})`,
+          failure_kind: "rejected",
+          child_started: false,
+          child_terminal: false,
+          ...correlation,
+        });
+      }
+    }
+    return denied;
+  }
   if (req.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
     await refreshModels();
     return Response.json({

@@ -42,6 +42,67 @@ stop_bridge() {
   bridge_pid=0
 }
 
+assert_none_policy_active() {
+  local label="$1"
+  [[ -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "$label bare policy backup missing while request was active"
+  jq -e '
+    .trustedWorkspaces == [] and
+    .permissions.allow == [] and
+    (.permissions.deny | index("read_file(/workspace)")) != null and
+    (.permissions.deny | index("write_file(/workspace)")) != null
+  ' "$HOME/.gemini/antigravity-cli/settings.json" >/dev/null || fail "$label bare access=none policy was not active"
+}
+
+assert_policy_restored() {
+  local label="$1"
+  local restored=0
+  for _ in $(seq 1 80); do
+    if [[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]]; then
+      restored=1
+      break
+    fi
+    sleep 0.1
+  done
+  (( restored == 1 )) || fail "$label bare workspace policy backup remained after terminal request"
+}
+
+assert_bare_abort_restores_none_policy() {
+  local port="$1" label="$2" output="$3"
+  local count_before count_now client_pid spawned=0
+  count_before="$(cat "$HOME/fake-agy-count.txt")"
+  curl -sS -o "$output" \
+    -H 'content-type: application/json' \
+    -H "Authorization: Bearer $AGY_TOKEN" \
+    -d '{"model":"gemini-test-high","messages":[{"role":"user","content":"FAKE_HANG"}]}' \
+    "http://127.0.0.1:$port/v1/chat/completions" >/dev/null 2>&1 &
+  client_pid=$!
+
+  for _ in $(seq 1 100); do
+    count_now="$(cat "$HOME/fake-agy-count.txt" 2>/dev/null || printf '0')"
+    if (( count_now > count_before )); then
+      spawned=1
+      break
+    fi
+    sleep 0.05
+  done
+  (( spawned == 1 )) || fail "$label bare abort request never spawned fake agy"
+  assert_none_policy_active "$label"
+  kill "$client_pid" 2>/dev/null || true
+  wait "$client_pid" 2>/dev/null || true
+  assert_policy_restored "$label abort"
+}
+
+assert_bare_child_failure_restores_none_policy() {
+  local port="$1" label="$2" output="$3" code
+  code="$(curl -sS -o "$output" -w '%{http_code}' \
+    -H 'content-type: application/json' \
+    -H "Authorization: Bearer $AGY_TOKEN" \
+    -d '{"model":"gemini-test-high","messages":[{"role":"user","content":"FAKE_CHILD_FAILURE"}]}' \
+    "http://127.0.0.1:$port/v1/chat/completions")"
+  assert_eq "$code" 502
+  [[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "$label bare policy backup remained after child failure"
+}
+
 # ----- default/no-workspace regression -----
 unset AGY_WORKSPACE_ROOT AGY_WORKSPACE_MODE AGY_WORKSPACE_HOST_PATH
 start_bridge 17421
@@ -116,8 +177,9 @@ assert_workspace_config_rejected() {
   fi
 }
 assert_workspace_config_rejected bad-root /not-workspace ro 1
-assert_workspace_config_rejected bad-mode /workspace rw 1
+assert_workspace_config_rejected bad-mode /workspace invalid 1
 assert_workspace_config_rejected bad-concurrency /workspace ro 2
+assert_workspace_config_rejected bad-rw-concurrency /workspace rw 2
 
 # ----- explicit read-only workspace runtime -----
 rm -f "$work"/agy-{input.ndjson,args.txt,cwd.txt,env.txt,count.txt}
@@ -129,6 +191,37 @@ export AGY_SECRETS_DIR="$work/secrets"
 export KEYRING_PASSWORD_FILE="$work/keyring-password"
 mkdir -p "$AGY_SECRETS_DIR"
 start_bridge 17422
+
+rm -f "$work"/agy-{input.ndjson,args.txt,cwd.txt,env.txt,count.txt} "$HOME"/fake-agy-{input.ndjson,args.txt,cwd.txt,env.txt,count.txt}
+bare_ro="$(curl -fsS \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"gemini-test-high","messages":[{"role":"user","content":"Reply to the bare route."}]}' \
+  http://127.0.0.1:17422/v1/chat/completions)"
+[[ "$bare_ro" == *'fake reply'* ]] || fail "RO deployment bare reply missing"
+[[ -f "$HOME/fake-agy-args.txt" ]] || fail "RO deployment bare child did not use the sanitized workspace environment"
+bare_ro_args="$(cat "$HOME/fake-agy-args.txt")"
+[[ "$bare_ro_args" == *'--agent raw'* ]] || fail "RO deployment bare route did not keep the raw agent"
+[[ "$(cat "$HOME/fake-agy-cwd.txt")" != /workspace ]] || fail "RO deployment bare child used /workspace as CWD"
+bare_ro_env="$HOME/fake-agy-env.txt"
+for secret_name in AGY_TOKEN AGY_SECRETS_DIR KEYRING_PASSWORD_FILE STATE_DIR AGY_WORKSPACE_HOST_PATH AGY_WORKSPACE_ROOT AGY_WORKSPACE_MODE AGY_WORKSPACE_BRIDGE_CANARY; do
+  ! grep -q "^${secret_name}=" "$bare_ro_env" || fail "RO deployment bare child leaked $secret_name"
+done
+grep -q '^HOME=' "$bare_ro_env" || fail "RO deployment bare child missing HOME"
+grep -q '^PATH=' "$bare_ro_env" || fail "RO deployment bare child missing PATH"
+[[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "RO deployment bare policy backup remained after success"
+assert_bare_abort_restores_none_policy 17422 'RO deployment' "$work/ro-bare-aborted.json"
+assert_bare_child_failure_restores_none_policy 17422 'RO deployment' "$work/ro-bare-child-failure.json"
+
+bare_ro_stream="$(curl -fsS -N \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"gemini-test-high","stream":true,"messages":[{"role":"user","content":"Stream a bare reply."}]}' \
+  http://127.0.0.1:17422/v1/chat/completions)"
+[[ "$bare_ro_stream" == *'data: [DONE]'* && "$bare_ro_stream" == *'fake reply'* ]] || fail "RO deployment bare stream without tools failed"
+[[ "$(cat "$HOME/fake-agy-cwd.txt")" != /workspace ]] || fail "RO deployment bare stream used /workspace as CWD"
+! grep -q '^AGY_WORKSPACE_MODE=' "$HOME/fake-agy-env.txt" || fail "RO deployment bare stream leaked workspace mode"
+[[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "RO deployment bare stream policy backup remained"
 
 workspace_ro="$(curl -fsS \
   -H 'content-type: application/json' \
@@ -226,6 +319,13 @@ stop_bridge
 export PRINT_TIMEOUT=1ms
 export AGY_HARD_MARGIN_MS=50
 start_bridge 17423
+code="$(curl -sS -o "$work/ro-bare-hard-deadline.json" -w '%{http_code}' \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"gemini-test-high","messages":[{"role":"user","content":"FAKE_HANG"}]}' \
+  http://127.0.0.1:17423/v1/chat/completions)"
+assert_eq "$code" 502
+[[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "RO deployment bare policy backup remained after hard deadline"
 code="$(curl -sS -o "$work/hard-deadline.json" -w '%{http_code}' \
   -H 'content-type: application/json' \
   -H "Authorization: Bearer $AGY_TOKEN" \
@@ -236,4 +336,224 @@ assert_eq "$code" 502
 stop_bridge
 unset PRINT_TIMEOUT AGY_HARD_MARGIN_MS
 
-echo "PASS: bridge default regression and explicit read-only workspace runtime"
+# ----- explicit read-write workspace runtime -----
+rm -f "$work"/agy-{input.ndjson,args.txt,cwd.txt,env.txt,count.txt}
+export AGY_WORKSPACE_ROOT=/workspace
+export AGY_WORKSPACE_MODE=rw
+export AGY_WORKSPACE_HOST_PATH='HOST_PATH_MUST_NOT_REACH_CHILD'
+export AGY_WORKSPACE_BRIDGE_CANARY='BRIDGE_CANARY_MUST_NOT_REACH_CHILD'
+export AGY_SECRETS_DIR="$work/rw-secrets"
+export KEYRING_PASSWORD_FILE="$work/rw-keyring-password"
+mkdir -p "$AGY_SECRETS_DIR"
+start_bridge 17424
+
+rm -f "$work"/agy-{input.ndjson,args.txt,cwd.txt,env.txt,count.txt} "$HOME"/fake-agy-{input.ndjson,args.txt,cwd.txt,env.txt,count.txt}
+bare_rw="$(curl -fsS \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"gemini-test-high","messages":[{"role":"user","content":"Reply to the bare route."}]}' \
+  http://127.0.0.1:17424/v1/chat/completions)"
+[[ "$bare_rw" == *'fake reply'* ]] || fail "RW deployment bare reply missing"
+[[ -f "$HOME/fake-agy-args.txt" ]] || fail "RW deployment bare child did not use the sanitized workspace environment"
+bare_rw_args="$(cat "$HOME/fake-agy-args.txt")"
+[[ "$bare_rw_args" == *'--agent raw'* ]] || fail "RW deployment bare route did not keep the raw agent"
+[[ "$(cat "$HOME/fake-agy-cwd.txt")" != /workspace ]] || fail "RW deployment bare child used /workspace as CWD"
+bare_rw_env="$HOME/fake-agy-env.txt"
+for secret_name in AGY_TOKEN AGY_SECRETS_DIR KEYRING_PASSWORD_FILE STATE_DIR AGY_WORKSPACE_HOST_PATH AGY_WORKSPACE_ROOT AGY_WORKSPACE_MODE AGY_WORKSPACE_BRIDGE_CANARY; do
+  ! grep -q "^${secret_name}=" "$bare_rw_env" || fail "RW deployment bare child leaked $secret_name"
+done
+grep -q '^HOME=' "$bare_rw_env" || fail "RW deployment bare child missing HOME"
+grep -q '^PATH=' "$bare_rw_env" || fail "RW deployment bare child missing PATH"
+[[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "RW deployment bare policy backup remained after success"
+assert_bare_abort_restores_none_policy 17424 'RW deployment' "$work/rw-bare-aborted.json"
+assert_bare_child_failure_restores_none_policy 17424 'RW deployment' "$work/rw-bare-child-failure.json"
+
+bare_rw_tool_stream="$(curl -fsS -N \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"gemini-test-high","stream":true,"messages":[{"role":"user","content":"Stream a bare reply with a client tool schema."}],"tools":[{"type":"function","function":{"name":"dummy_tool","description":"test only","parameters":{"type":"object","properties":{}}}}]}' \
+  http://127.0.0.1:17424/v1/chat/completions)"
+[[ "$bare_rw_tool_stream" == *'data: [DONE]'* ]] || fail "RW deployment bare stream with tools missing DONE"
+[[ "$(cat "$HOME/fake-agy-cwd.txt")" != /workspace ]] || fail "RW deployment bare tool stream used /workspace as CWD"
+! grep -q '^AGY_WORKSPACE_MODE=' "$HOME/fake-agy-env.txt" || fail "RW deployment bare tool stream leaked workspace mode"
+[[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "RW deployment bare tool stream policy backup remained"
+
+workspace_rw_ro="$(curl -fsS \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"auto-ro-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"Inspect the caller project read-only."}]}' \
+  http://127.0.0.1:17424/v1/chat/completions)"
+[[ "$workspace_rw_ro" == *'fake reply'* ]] || fail "RW deployment auto-ro reply missing"
+rw_ro_args="$(cat "$HOME/fake-agy-args.txt")"
+[[ "$rw_ro_args" == *'--agent agy-bridge-worker-ro-v1'* ]] || fail "RW deployment auto-ro did not use reserved RO agent"
+assert_eq "$(cat "$HOME/fake-agy-cwd.txt")" /workspace
+rw_ro_env="$HOME/fake-agy-env.txt"
+for secret_name in AGY_TOKEN AGY_SECRETS_DIR KEYRING_PASSWORD_FILE STATE_DIR AGY_WORKSPACE_HOST_PATH AGY_WORKSPACE_ROOT AGY_WORKSPACE_MODE AGY_WORKSPACE_BRIDGE_CANARY; do
+  ! grep -q "^${secret_name}=" "$rw_ro_env" || fail "RW deployment auto-ro child leaked $secret_name"
+done
+grep -q '^HOME=' "$rw_ro_env" || fail "RW deployment auto-ro child missing HOME"
+grep -q '^PATH=' "$rw_ro_env" || fail "RW deployment auto-ro child missing PATH"
+
+workspace_rw="$(curl -fsS \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"Modify the caller project."}]}' \
+  http://127.0.0.1:17424/v1/chat/completions)"
+[[ "$workspace_rw" == *'fake reply'* ]] || fail "RW deployment auto-rw reply missing"
+rw_args="$(cat "$HOME/fake-agy-args.txt")"
+[[ "$rw_args" == *'--agent agy-bridge-worker-rw-v1'* ]] || fail "RW deployment auto-rw did not use reserved RW agent"
+assert_eq "$(cat "$HOME/fake-agy-cwd.txt")" /workspace
+rw_prompt="$(deno eval --allow-read="$HOME/fake-agy-input.ndjson" '
+  const raw = await Deno.readTextFile(Deno.args[0]);
+  const ev = JSON.parse(raw.trim());
+  console.log(ev.message?.content ?? "");
+' "$HOME/fake-agy-input.ndjson")"
+[[ "$rw_prompt" == *'The operator explicitly exposed one caller project at /workspace in read-write mode.'* ]] || fail "RW contract mode/root missing"
+[[ "$rw_prompt" == *'Treat /workspace as the only caller project root.'* ]] || fail "RW contract sole root missing"
+[[ "$rw_prompt" == *'Do not treat /app, HOME, the bridge process directory, bridge state, configuration, keyring data, or secrets as caller project files.'* ]] || fail "RW contract non-workspace boundary missing"
+[[ "$rw_prompt" == *'You may read, create, and replace project file contents only within /workspace.'* ]] || fail "RW contract file capability missing"
+[[ "$rw_prompt" == *'This agent has no shell-command capability and no generic file-delete capability.'* ]] || fail "RW contract command/delete boundary missing"
+rw_env="$HOME/fake-agy-env.txt"
+for secret_name in AGY_TOKEN AGY_SECRETS_DIR KEYRING_PASSWORD_FILE STATE_DIR AGY_WORKSPACE_HOST_PATH AGY_WORKSPACE_ROOT AGY_WORKSPACE_MODE AGY_WORKSPACE_BRIDGE_CANARY; do
+  ! grep -q "^${secret_name}=" "$rw_env" || fail "RW workspace child leaked $secret_name"
+done
+grep -q '^HOME=' "$rw_env" || fail "RW workspace child missing HOME"
+grep -q '^PATH=' "$rw_env" || fail "RW workspace child missing PATH"
+[[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "RW workspace policy backup remained after successful request"
+
+# Live containment verification needs an auditable signal that an autonomous
+# request actually reached a native tool step rather than merely replying with
+# the word DENIED. Keep the usage evidence content-free: only record the count
+# of tool step updates for the completed request.
+tool_step_rw="$(curl -fsS \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"FAKE_TOOL_STEP"}]}' \
+  http://127.0.0.1:17424/v1/chat/completions)"
+[[ "$tool_step_rw" == *'fake reply'* ]] || fail "RW tool-step evidence request did not complete"
+jq -e '
+  .autonomous == "rw" and
+  .agent == "agy-bridge-worker-rw-v1" and
+  .tool_step_updates == 1
+' < <(tail -n 1 "$STATE_DIR/usage.jsonl") >/dev/null || fail "RW usage log did not record exactly one native tool step update"
+
+# Real agy 1.2.2 can emit a native tool step with no narration text_delta.
+# Evidence accounting must count the tool event itself rather than depending on
+# an optional display delta.
+tool_step_no_text_rw="$(curl -fsS \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"FAKE_TOOL_STEP_NO_TEXT"}]}' \
+  http://127.0.0.1:17424/v1/chat/completions)"
+[[ "$tool_step_no_text_rw" == *'fake reply'* ]] || fail "RW no-text tool-step evidence request did not complete"
+jq -e '
+  .autonomous == "rw" and
+  .agent == "agy-bridge-worker-rw-v1" and
+  .tool_step_updates == 1
+' < <(tail -n 1 "$STATE_DIR/usage.jsonl") >/dev/null || fail "RW usage log ignored a native tool step without text_delta"
+
+# A writable RW request can create a workspace-local file after startup. If it
+# plants the reserved managed-agent path, the next request must fail before a
+# second agy child is spawned.
+rm -rf /workspace/.agents
+count_before="$(cat "$HOME/fake-agy-count.txt")"
+plant_collision="$(curl -fsS \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"FAKE_CREATE_RW_AGENT_COLLISION"}]}' \
+  http://127.0.0.1:17424/v1/chat/completions)"
+[[ "$plant_collision" == *'fake reply'* ]] || fail "RW collision fixture request did not complete"
+[[ -f /workspace/.agents/agents/agy-bridge-worker-rw-v1/agent.md ]] || fail "RW collision fixture was not created"
+count_after_plant="$(cat "$HOME/fake-agy-count.txt")"
+(( count_after_plant == count_before + 1 )) || fail "RW collision fixture request did not spawn exactly one fake agy"
+
+code="$(curl -sS -o "$work/rw-agent-shadow-denied.json" -w '%{http_code}' \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"Reply after collision."}]}' \
+  http://127.0.0.1:17424/v1/chat/completions)"
+count_after_denied="$(cat "$HOME/fake-agy-count.txt")"
+rm -rf /workspace/.agents
+assert_eq "$code" 502
+assert_eq "$count_after_denied" "$count_after_plant"
+[[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "RW workspace policy backup created before reserved-agent assertion failed"
+
+# RW abort must keep the write policy applied only while the child is active,
+# then restore it before the MAX_CONCURRENT=1 slot can be reused.
+count_before="$(cat "$HOME/fake-agy-count.txt")"
+curl -sS -o "$work/rw-aborted-request.json" \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"FAKE_HANG"}]}' \
+  http://127.0.0.1:17424/v1/chat/completions \
+  >"$work/rw-aborted-request.out" 2>"$work/rw-aborted-request.err" &
+rw_abort_client_pid=$!
+
+rw_abort_spawned=0
+for _ in $(seq 1 100); do
+  if [[ -f "$HOME/fake-agy-count.txt" ]]; then
+    count_now="$(cat "$HOME/fake-agy-count.txt")"
+    if (( count_now > count_before )); then
+      rw_abort_spawned=1
+      break
+    fi
+  fi
+  sleep 0.05
+done
+(( rw_abort_spawned == 1 )) || fail "aborted RW workspace request never spawned fake agy"
+[[ -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "RW workspace policy backup missing while aborted request was active"
+jq -e '.permissions.allow | index("write_file(/workspace)") != null' \
+  "$HOME/.gemini/antigravity-cli/settings.json" >/dev/null || fail "RW write policy not active during request"
+
+kill "$rw_abort_client_pid" 2>/dev/null || true
+wait "$rw_abort_client_pid" 2>/dev/null || true
+
+rw_abort_restored=0
+for _ in $(seq 1 80); do
+  if [[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]]; then
+    rw_abort_restored=1
+    break
+  fi
+  sleep 0.1
+done
+(( rw_abort_restored == 1 )) || fail "RW workspace policy backup remained after client abort"
+
+after_rw_abort="$(curl -fsS \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"Reply after RW abort cleanup."}]}' \
+  http://127.0.0.1:17424/v1/chat/completions)"
+[[ "$after_rw_abort" == *'fake reply'* ]] || fail "RW workspace concurrency slot was not released after client abort"
+
+# Natural RW child failure must restore the shared policy transaction.
+code="$(curl -sS -o "$work/rw-child-failure.json" -w '%{http_code}' \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"FAKE_CHILD_FAILURE"}]}' \
+  http://127.0.0.1:17424/v1/chat/completions)"
+assert_eq "$code" 502
+[[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "RW workspace policy backup remained after child failure"
+stop_bridge
+
+# RW hard-deadline cleanup follows the same terminal-child-before-restore path.
+export PRINT_TIMEOUT=1ms
+export AGY_HARD_MARGIN_MS=50
+start_bridge 17425
+code="$(curl -sS -o "$work/rw-bare-hard-deadline.json" -w '%{http_code}' \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"gemini-test-high","messages":[{"role":"user","content":"FAKE_HANG"}]}' \
+  http://127.0.0.1:17425/v1/chat/completions)"
+assert_eq "$code" 502
+[[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "RW deployment bare policy backup remained after hard deadline"
+code="$(curl -sS -o "$work/rw-hard-deadline.json" -w '%{http_code}' \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGY_TOKEN" \
+  -d '{"model":"auto-rw-gemini-test","reasoning_effort":"high","messages":[{"role":"user","content":"FAKE_HANG"}]}' \
+  http://127.0.0.1:17425/v1/chat/completions)"
+assert_eq "$code" 502
+[[ ! -e "$STATE_DIR/workspace-policy-backup.json" ]] || fail "RW workspace policy backup remained after hard deadline"
+stop_bridge
+unset PRINT_TIMEOUT AGY_HARD_MARGIN_MS
+
+echo "PASS: bridge default regression and explicit RO/RW workspace runtime"

@@ -33,6 +33,9 @@ USER agy
 ENV HOME=/home/agy
 ENV DENO_DIR=/home/agy/.cache/deno
 ENV PATH=/home/agy/.local/bin:${PATH}
+# Disable the CLI's own updater so it does not replace the checksum-pinned
+# artifact. This does not make the binary path filesystem-immutable.
+ENV AGY_CLI_DISABLE_AUTO_UPDATE=true
 
 ARG AGY_VERSION=1.2.2
 ARG AGY_ARTIFACT_URL=https://storage.googleapis.com/antigravity-public/antigravity-cli/1.2.2-6061403484848128/linux-x64/cli_linux_x64.tar.gz
@@ -51,6 +54,7 @@ COPY --chown=agy:agy . /app
 USER root
 RUN find /app/docker -type f -name '*.sh' -exec sed -i 's/\r$//' {} + \
  && sed -i 's/\r$//' /app/docker/workspace/verified-agy-versions.txt \
+ && sed -i 's/\r$//' /app/docker/workspace/verified-rw-agy-versions.txt \
  && chmod +x /app/docker/*.sh
 USER agy
 

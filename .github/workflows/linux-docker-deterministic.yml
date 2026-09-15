@@ -3,7 +3,7 @@ name: Linux Docker deterministic
 on:
   push:
     branches:
-      - "impl/pr3-explicit-host-workspace-ro"
+      - "impl/pr4-read-write-host-workspace"
     paths:
       - "Dockerfile"
       - ".dockerignore"
@@ -55,7 +55,7 @@ jobs:
           PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           PUSH_HEAD_SHA: ${{ github.sha }}
           PUSH_REPOSITORY: ${{ github.repository }}
-          FROZEN_BASE_REF: f5ae309fd1cfe11653753d9b62eb7da19abac767
+          FROZEN_BASE_REF: 06567660cb765285cf68f28637169c79ddd1aabc
           DISPATCH_HEAD_SHA: ${{ github.sha }}
           DISPATCH_BASE_REF: ${{ inputs.base_ref }}
           DISPATCH_REPOSITORY: ${{ github.repository }}
@@ -102,7 +102,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify repository identity and PR3 scope
+      - name: Verify repository identity and PR4 scope
         shell: pwsh
         env:
           EXPECTED_HEAD: ${{ steps.refs.outputs.head_sha }}

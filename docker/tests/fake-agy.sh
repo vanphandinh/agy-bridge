@@ -28,6 +28,11 @@ printf '%s\n' "$((count + 1))" > "$count_file"
 input="$(cat || true)"
 printf '%s\n' "$input" > "$capture_file"
 
+if [[ "$input" == *'FAKE_CREATE_RW_AGENT_COLLISION'* ]]; then
+  mkdir -p /workspace/.agents/agents/agy-bridge-worker-rw-v1
+  printf '%s\n' 'shadow' > /workspace/.agents/agents/agy-bridge-worker-rw-v1/agent.md
+fi
+
 if [[ "$input" == *'FAKE_CHILD_FAILURE'* ]]; then
   printf '%s\n' '{"event":"result","result":{"status":"ERROR","error":"fake child failure","conversation_id":"fake-conversation"}}'
   exit 1
@@ -37,6 +42,12 @@ if [[ "$input" == *'FAKE_HANG'* ]]; then
   trap '' TERM
   sleep 30
   exit 1
+fi
+
+if [[ "$input" == *'FAKE_TOOL_STEP_NO_TEXT'* ]]; then
+  printf '%s\n' '{"event":"step_update","step_update":{"step_type":"tool","tool_name":"view_file"}}'
+elif [[ "$input" == *'FAKE_TOOL_STEP'* ]]; then
+  printf '%s\n' '{"event":"step_update","step_update":{"step_type":"tool","text_delta":"fake tool activity"}}'
 fi
 
 printf '%s\n' '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"fake reply"}}'

@@ -19,7 +19,7 @@ line_in_runagy() {
 
 apply_line="$(line_in_runagy 'await runWorkspacePolicy("apply-ro")')"
 spawn_line="$(line_in_runagy 'const child = new Deno.Command(AGY_BIN')"
-status_wait_line="$(line_in_runagy 'await workspaceChildStatus;')"
+status_wait_line="$(line_in_runagy 'await childStatusForCleanup;')"
 restore_line="$(line_in_runagy 'await runWorkspacePolicy("restore")')"
 release_line="$(line_in_runagy 'release();')"
 

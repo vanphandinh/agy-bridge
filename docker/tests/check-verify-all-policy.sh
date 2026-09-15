@@ -5,6 +5,7 @@ identity_file="${2:-/app/docker/tests/assert-pr3-identity.ps1}"
 identity_test="${3:-/app/docker/tests/test-verifier-identity.ps1}"
 docs_file="${4:-/app/docs/docker-compose.md}"
 suite_file="${5:-/app/docker/tests/run.sh}"
+evidence_test="${6:-/app/docker/tests/test-verify-workspace-evidence.ps1}"
 
 [[ -f "$file" ]] || {
   echo "missing full verifier: $file" >&2
@@ -31,6 +32,11 @@ suite_file="${5:-/app/docker/tests/run.sh}"
   exit 1
 }
 
+[[ -f "$evidence_test" ]] || {
+  echo "missing exact-target evidence regression: $evidence_test" >&2
+  exit 1
+}
+
 required=(
   '[string]$ExpectedHead'
   '[string]$Model'
@@ -41,14 +47,59 @@ required=(
   'test-build-context.ps1'
   'test-compose.ps1'
   'test-compose-workspace.ps1'
+  'test-compose-workspace-rw.ps1'
+  'test-verify-workspace-evidence.ps1'
+  'Verifier exact-target evidence regression'
   'compose.workspace.yaml'
+  'compose.workspace-rw.yaml'
   'AGY_WORKSPACE_HOST_PATH'
   'verified-agy-versions.txt'
+  'verified-rw-agy-versions.txt'
+  'RW exact agy version and fixture setup'
+  'RW intended workspace mutation'
+  'RW reserved-agent shadow denial'
+  'RW generic deletion denial'
+  'RW non-workspace read denial'
+  'RW non-workspace write denial'
+  'RW traversal denial'
+  'RW symlink denial'
+  'RW environment canary exclusion'
+  'RW_CONTROL_OK'
+  'RW denial probe requires HTTP 200 explicit DENIED evidence'
+  'RW reserved-agent shadow denial probe requires HTTP 200 explicit DENIED evidence'
+  'function Assert-LatestWorkspaceToolStep'
+  'function Assert-LatestWorkspaceToolInvocation'
+  'transcript_full.jsonl'
+  'conversation_id'
+  '[string[]]$ExpectedToolNames'
+  '[string[]]$ExpectedPathFields'
+  'function Start-WorkspaceChildEnvObserver'
+  'observe-child-env.sh'
+  "'exec', '-T', '-d', 'agy-bridge'"
+  "[ValidateSet('ro', 'rw')][string]\$DeploymentMode"
+  'tool_step_updates'
+  'Assert-LatestWorkspaceToolStep -DeploymentMode ro -UsageEvidence $res.TerminalEvidence -Context "RO read denial probe for $Path"'
+  'Assert-LatestWorkspaceToolStep -DeploymentMode rw -UsageEvidence $res.TerminalEvidence -Context "RW read denial probe for $Path"'
+  'Assert-LatestWorkspaceToolStep -DeploymentMode rw -UsageEvidence $res.TerminalEvidence -Context "RW write denial probe for $Path"'
+  "Assert-LatestWorkspaceToolStep -DeploymentMode rw -UsageEvidence \$res.TerminalEvidence -Context 'RW reserved-agent shadow denial probe'"
+  'Assert-LatestWorkspaceToolInvocation -DeploymentMode ro -UsageEvidence $res.TerminalEvidence -ExpectedPath $Path'
+  'Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -UsageEvidence $res.TerminalEvidence -ExpectedPath $Path'
+  'Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -UsageEvidence $res.TerminalEvidence -ExpectedPath $reservedContainerPath'
+  "Assert-LatestWorkspaceToolInvocation -DeploymentMode \$DeploymentMode -UsageEvidence \$response.TerminalEvidence -ExpectedPath '/workspace/bare-route-canary.txt' -BareRoute"
+  'did not reach a native tool step'
+  'did not record a native tool invocation for the exact denied path'
+  'Workspace denial probe requires HTTP 200 explicit DENIED evidence'
+  'bare workspace probe requires HTTP 200 explicit DENIED evidence'
+  'RW Docker control-surface assertions'
   'Workspace exact agy version gate and fixture setup'
   'Workspace read access'
   'Workspace host immutability'
+  'workspace mutation probe requires HTTP 200 evidence'
   'Workspace auto-rw denial'
   'Workspace non-workspace canary denial'
+  'First use an available project file tool to read /workspace/README-fixture.txt.'
+  'RO bare-route workspace isolation'
+  'RW bare-route workspace isolation'
   '/app/.workspace-app-canary/value.txt'
   '/workspace/../app/.workspace-app-canary/value.txt'
   'Get-WorkspaceFingerprint'
@@ -102,19 +153,52 @@ for needle in "${required[@]}"; do
   }
 done
 
+control_read_probe_count="$(grep -F -c -- 'First use an available project file tool to read /workspace/README-fixture.txt.' "$file" || true)"
+if [[ "$control_read_probe_count" -lt 3 ]]; then
+  echo "RO/RW non-workspace denial probes must force a native in-workspace control read before policy denial; found $control_read_probe_count prompt(s)" >&2
+  exit 1
+fi
+
+grep -F -- 'test-child-env-observer.sh /app/docker/tests/observe-child-env.sh' "$suite_file" >/dev/null || {
+  echo 'deterministic Docker suite is missing the pre-armed child observer regression' >&2
+  exit 1
+}
+
+if grep -F -- '$responseTask.IsCompleted' "$file" >/dev/null; then
+  echo 'live child environment observation must be pre-armed before the request, not raced against response completion' >&2
+  exit 1
+fi
+
+if grep -F -- '$res.StatusCode -ne 200 -and $res.StatusCode -ne 502' "$file" >/dev/null; then
+  echo 'RO workspace mutation probe must not accept HTTP 502 as immutability evidence' >&2
+  exit 1
+fi
+
+if grep -F -- 'RW reserved-agent shadow denial probe returned unexpected HTTP' "$file" >/dev/null; then
+  echo 'RW reserved-agent shadow denial must not accept HTTP 502 as positive containment evidence' >&2
+  exit 1
+fi
+
 identity_required=(
   '[string]$ExpectedHead'
   '[string]$BaseRef'
-  'f5ae309fd1cfe11653753d9b62eb7da19abac767'
-  'git rev-parse HEAD'
+  '06567660cb765285cf68f28637169c79ddd1aabc'
+  '832d87d32bbc08ed1cb8ef105d41a7c4f27c4a63'
+  "'rev-parse', 'HEAD'"
   '--untracked-files=all'
   'Base ref mismatch'
+  "'rev-list', '--parents'"
   'merge-base'
   '--is-ancestor'
   "'diff', '--name-only'"
   '^docker/tests/'
-  'docs/docker-compose.md'
   '.github/workflows/linux-docker-deterministic.yml'
+  'compose.workspace-rw.yaml'
+  'agents/agy-bridge-worker-rw-v1/agent.md'
+  'docker/workspace/verified-rw-agy-versions.txt'
+  'docs/superpowers/plans/2026-09-14-read-write-host-workspace-pr4.md'
+  'docs/superpowers/specs/2026-09-13-read-write-host-workspace-design.md'
+  'docs/docker-compose.md'
   "'diff', '--check'"
 )
 
@@ -130,7 +214,8 @@ identity_regression_required=(
   'non-ancestor base'
   'disallowed changed path'
   'arbitrary untracked local file'
-  'allowed verifier/docs/workflow diff'
+  'allowed PR4 verifier/docs/runtime/workflow diff'
+  'PR4 Linux deterministic workflow identity wiring'
 )
 
 for needle in "${identity_regression_required[@]}"; do
@@ -140,34 +225,36 @@ for needle in "${identity_regression_required[@]}"; do
   }
 done
 
-grep -F -- 'f5ae309fd1cfe11653753d9b62eb7da19abac767' "$docs_file" >/dev/null || {
-  echo 'Docker deployment guide must pin the final frozen main SHA' >&2
+grep -F -- '06567660cb765285cf68f28637169c79ddd1aabc' "$docs_file" >/dev/null || {
+  echo 'Docker deployment guide must pin the PR3 integration baseline SHA' >&2
   exit 1
 }
+
+if grep -F -- 'f5ae309fd1cfe11653753d9b62eb7da19abac767' "$identity_file" >/dev/null; then
+  echo 'PR4 identity gate still references the pre-PR3-integration main SHA' >&2
+  exit 1
+fi
+
+if grep -F -- '0cdfe4131b59e2e93791437ffe85dc5b9895589f' "$identity_file" "$file" >/dev/null; then
+  echo 'active verifier identity must not use the stale historical PR3 SHA' >&2
+  exit 1
+fi
 
 if grep -F -- '878bb90a16281cc66a0c8ef849bb4329c2fab665' "$docs_file" >/dev/null; then
   echo 'Docker deployment guide still references the obsolete PR2 SHA' >&2
   exit 1
 fi
 
-# The Docker Desktop checkpoint must prove an observed daemon outage rather
-# than require a container StartedAt change. Desktop/daemon restarts can keep
-# a container runtime alive, and prior gates already prove container restart,
-# down/up, recreate, and rebuild persistence independently.
 if grep -F -- 'container StartedAt did not change' "$file" >/dev/null; then
   echo 'full verifier must not use container StartedAt as Docker Desktop restart proof' >&2
   exit 1
 fi
 
-# Restart probes must be independently time-bounded. A synchronous
-# Invoke-DockerCapture('info') can hang on the Windows Docker named pipe while
-# Docker Desktop is restarting and freeze the whole verifier.
 if grep -F -- "Invoke-DockerCapture -ArgumentList @('info')" "$file" >/dev/null; then
   echo 'Docker Desktop restart probe must not call blocking Invoke-DockerCapture docker info' >&2
   exit 1
 fi
 
-# The verifier must never require host Deno/Bash/Python for the Deno gates.
 if grep -E '^[[:space:]]*&?[[:space:]]*deno[[:space:]]+(lint|task test)' "$file" >/dev/null; then
   echo 'full verifier must run Deno checks inside the Docker test service' >&2
   exit 1
@@ -179,7 +266,7 @@ if grep -E 'upstream/main|origin/main' "$file" >/dev/null; then
 fi
 
 if grep -F -- '...HEAD' "$identity_file" >/dev/null; then
-  echo 'full verifier must prove ancestry before diffing PR2 -> PR3; triple-dot alone is not an identity gate' >&2
+  echo 'full verifier must prove ancestry before diffing the PR4 baseline -> HEAD; triple-dot alone is not an identity gate' >&2
   exit 1
 fi
 
