@@ -121,15 +121,17 @@ try {
   $worktrees += $allowedWorktree
   New-Item -ItemType Directory -Force -Path (Join-Path $allowedWorktree 'docker/tests') | Out-Null
   New-Item -ItemType Directory -Force -Path (Join-Path $allowedWorktree 'docs') | Out-Null
+  New-Item -ItemType Directory -Force -Path (Join-Path $allowedWorktree 'tests') | Out-Null
   New-Item -ItemType Directory -Force -Path (Join-Path $allowedWorktree 'agents/agy-bridge-worker-ro-v1') | Out-Null
   New-Item -ItemType Directory -Force -Path (Join-Path $allowedWorktree 'agents/agy-bridge-worker-rw-v1') | Out-Null
   Set-Content -NoNewline -Path (Join-Path $allowedWorktree 'docker/tests/identity-allowed.txt') -Value 'allowed verifier test change'
+  Set-Content -NoNewline -Path (Join-Path $allowedWorktree 'tests/service.test.ts') -Value 'allowed bridge lifecycle regression fixture'
   Set-Content -NoNewline -Path (Join-Path $allowedWorktree 'docs/docker-compose.md') -Value 'allowed docs change'
   Set-Content -NoNewline -Path (Join-Path $allowedWorktree 'compose.workspace-rw.yaml') -Value 'services: {}'
   Set-Content -NoNewline -Path (Join-Path $allowedWorktree 'agents/agy-bridge-worker-ro-v1/agent.md') -Value 'allowed RO agent hardening fixture'
   Set-Content -NoNewline -Path (Join-Path $allowedWorktree 'agents/agy-bridge-worker-rw-v1/agent.md') -Value 'allowed RW agent fixture'
   Set-Content -NoNewline -Path (Join-Path $allowedWorktree '.github/workflows/linux-docker-deterministic.yml') -Value 'name: allowed PR4 workflow fixture'
-  Invoke-Git -WorkingDirectory $allowedWorktree -ArgumentList @('add', 'docker/tests/identity-allowed.txt', 'docs/docker-compose.md', 'compose.workspace-rw.yaml', 'agents/agy-bridge-worker-ro-v1/agent.md', 'agents/agy-bridge-worker-rw-v1/agent.md', '.github/workflows/linux-docker-deterministic.yml') | Out-Null
+  Invoke-Git -WorkingDirectory $allowedWorktree -ArgumentList @('add', 'docker/tests/identity-allowed.txt', 'tests/service.test.ts', 'docs/docker-compose.md', 'compose.workspace-rw.yaml', 'agents/agy-bridge-worker-ro-v1/agent.md', 'agents/agy-bridge-worker-rw-v1/agent.md', '.github/workflows/linux-docker-deterministic.yml') | Out-Null
   Invoke-Git -WorkingDirectory $allowedWorktree -ArgumentList @(
     '-c', 'user.name=PR4 Identity Test',
     '-c', 'user.email=pr4-identity-test@example.invalid',

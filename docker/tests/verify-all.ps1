@@ -35,6 +35,8 @@ $script:WorkspaceRwPreviousHostPath = $null
 $script:WorkspaceRwMarkers = $null
 $script:WorkspaceRwCanaries = $null
 $script:WorkspaceRwEnvProbePassed = $false
+$script:CleanupBlocked = $false
+$script:CleanupBlockReason = $null
 
 function Add-Result {
   param(
@@ -128,11 +130,27 @@ function Invoke-Http {
     [Parameter(Mandatory = $true)][ValidateSet('GET', 'POST')][string]$Method,
     [Parameter(Mandatory = $true)][string]$Uri,
     [hashtable]$Headers = @{},
-    [string]$Body = ''
+    [string]$Body = '',
+    [string]$RequestId = ''
   )
 
+  if (
+    -not [string]::IsNullOrWhiteSpace($RequestId) -and
+    $RequestId -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+  ) {
+    throw 'request correlation id contains unsupported characters'
+  }
+
   $client = [System.Net.Http.HttpClient]::new()
-  $client.Timeout = [TimeSpan]::FromSeconds($RequestTimeoutSec)
+  # Own the deadline explicitly so a verifier timeout is distinguishable from
+  # an unrelated cancellation. HttpClient.Timeout otherwise surfaces both as
+  # TaskCanceledException ("A task was canceled."). A client-side timeout does
+  # not prove that the bridge request or its child process has terminated.
+  $client.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan
+  $deadlineCts = [System.Threading.CancellationTokenSource]::new()
+  $deadlineCts.CancelAfter([TimeSpan]::FromSeconds($RequestTimeoutSec))
+  $startedAt = [DateTime]::UtcNow
+  $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
   $request = [System.Net.Http.HttpRequestMessage]::new(
     [System.Net.Http.HttpMethod]::new($Method),
     $Uri
@@ -147,6 +165,11 @@ function Invoke-Http {
         throw "unable to set HTTP header: $name"
       }
     }
+    if (-not [string]::IsNullOrWhiteSpace($RequestId)) {
+      if (-not $request.Headers.TryAddWithoutValidation('X-Agy-Request-Id', $RequestId)) {
+        throw 'unable to set request correlation header'
+      }
+    }
     if ($Method -eq 'POST') {
       $request.Content = [System.Net.Http.StringContent]::new(
         $Body,
@@ -155,12 +178,63 @@ function Invoke-Http {
       )
     }
 
-    $response = $client.SendAsync($request).GetAwaiter().GetResult()
+    try {
+      $response = $client.SendAsync($request, $deadlineCts.Token).GetAwaiter().GetResult()
+    }
+    catch {
+      $cause = $_.Exception
+      while ($null -ne $cause.InnerException) {
+        $cause = $cause.InnerException
+      }
+      if ($cause -is [System.OperationCanceledException]) {
+        $stopwatch.Stop()
+        $outcome = if ($deadlineCts.IsCancellationRequested) { 'timeout' } else { 'cancelled' }
+        $endedAt = [DateTime]::UtcNow
+        Write-Host (
+          '[HTTP] request_id={0} outcome={1} started_utc={2} ended_utc={3} elapsed_ms={4} deadline_sec={5} terminal_state=unknown' -f
+          $RequestId,
+          $outcome,
+          $startedAt.ToString('o'),
+          $endedAt.ToString('o'),
+          [Math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2),
+          $RequestTimeoutSec
+        ) -ForegroundColor DarkYellow
+        return [pscustomobject]@{
+          RequestId = $RequestId
+          Outcome = $outcome
+          StatusCode = $null
+          Content = ''
+          StartedAtUtc = $startedAt.ToString('o')
+          EndedAtUtc = $endedAt.ToString('o')
+          ElapsedMs = [Math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
+          DeadlineSec = $RequestTimeoutSec
+          TerminalState = 'unknown'
+        }
+      }
+      throw
+    }
     try {
       $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+      $stopwatch.Stop()
+      $endedAt = [DateTime]::UtcNow
+      Write-Host (
+        '[HTTP] request_id={0} outcome=completed started_utc={1} ended_utc={2} elapsed_ms={3} deadline_sec={4} terminal_state=http_response' -f
+        $RequestId,
+        $startedAt.ToString('o'),
+        $endedAt.ToString('o'),
+        [Math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2),
+        $RequestTimeoutSec
+      ) -ForegroundColor DarkGray
       return [pscustomobject]@{
+        RequestId = $RequestId
+        Outcome = 'completed'
         StatusCode = [int]$response.StatusCode
         Content = $content
+        StartedAtUtc = $startedAt.ToString('o')
+        EndedAtUtc = $endedAt.ToString('o')
+        ElapsedMs = [Math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
+        DeadlineSec = $RequestTimeoutSec
+        TerminalState = 'http_response'
       }
     }
     finally {
@@ -169,6 +243,7 @@ function Invoke-Http {
   }
   finally {
     $request.Dispose()
+    $deadlineCts.Dispose()
     $client.Dispose()
   }
 }
@@ -352,21 +427,12 @@ function Invoke-CompletionSmoke {
     [Parameter(Mandatory = $true)][string]$Token,
     [Parameter(Mandatory = $true)][string]$Prompt
   )
-  $body = @{
-    model = $WireModel
-    messages = @(@{ role = 'user'; content = $Prompt })
-  } | ConvertTo-Json -Depth 8 -Compress
-  $res = Invoke-Http -Method POST -Uri "$($script:ApiBase)/v1/chat/completions" -Headers @{
-    Authorization = "Bearer $Token"
-  } -Body $body
-  if ($res.StatusCode -ne 200) {
-    throw "$WireModel completion returned HTTP $($res.StatusCode): $($res.Content)"
-  }
-  $json = $res.Content | ConvertFrom-Json
-  $content = [string]$json.choices[0].message.content
-  if ([string]::IsNullOrWhiteSpace($content)) {
-    throw "$WireModel completion returned no assistant content"
-  }
+  $res = Invoke-CompletionResponse `
+    -WireModel $WireModel `
+    -Token $Token `
+    -Prompt $Prompt `
+    -DeploymentMode default
+  [void](Get-CompletionText -Response $res)
 }
 
 function Invoke-StreamingSmoke {
@@ -379,9 +445,23 @@ function Invoke-StreamingSmoke {
     stream = $true
     messages = @(@{ role = 'user'; content = 'Reply briefly with STREAM_VERIFY_OK.' })
   } | ConvertTo-Json -Depth 8 -Compress
+  $requestId = 'verify-' + [Guid]::NewGuid().ToString('N')
   $res = Invoke-Http -Method POST -Uri "$($script:ApiBase)/v1/chat/completions" -Headers @{
     Authorization = "Bearer $Token"
-  } -Body $body
+  } -Body $body -RequestId $requestId
+  $terminal = Wait-RequestTerminalEvidence -RequestId $requestId -DeploymentMode default
+  $terminalState = if ($terminal.ChildStarted) { 'child_terminal' } else { 'no_child_spawned' }
+  $res | Add-Member -NotePropertyName TerminalState -NotePropertyValue $terminalState -Force
+  $res | Add-Member -NotePropertyName TerminalEvidence -NotePropertyValue $terminal -Force
+  if ($res.Outcome -ne 'completed') {
+    throw (
+      'streaming completion transport {0} after {1}s; request_id={2}; terminal_state={3}' -f
+      $res.Outcome,
+      $res.DeadlineSec,
+      $res.RequestId,
+      $res.TerminalState
+    )
+  }
   if ($res.StatusCode -ne 200) {
     throw "streaming completion returned HTTP $($res.StatusCode): $($res.Content)"
   }
@@ -489,6 +569,114 @@ function Invoke-WorkspaceDockerCapture {
   return Invoke-DockerCapture -ArgumentList @($prefix + $ArgumentList) -AllowFailure:$AllowFailure -Quiet:$Quiet
 }
 
+function Get-RequestUsageEvidence {
+  param(
+    [Parameter(Mandatory = $true)][string]$RequestId,
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode
+  )
+
+  $tailArgs = @(
+    'exec', '-T', 'agy-bridge',
+    'tail', '-n', '200',
+    '/home/agy/.local/state/agy-bridge/usage.jsonl'
+  )
+  if ($DeploymentMode -eq 'ro') {
+    $capture = Invoke-WorkspaceDockerCapture -ArgumentList $tailArgs -AllowFailure -Quiet
+  }
+  elseif ($DeploymentMode -eq 'rw') {
+    $capture = Invoke-WorkspaceRwDockerCapture -ArgumentList $tailArgs -AllowFailure -Quiet
+  }
+  else {
+    $captureArgs = @('compose') + $tailArgs
+    $capture = Invoke-DockerCapture -ArgumentList $captureArgs -AllowFailure -Quiet
+  }
+  if ($capture.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($capture.Output)) {
+    return [pscustomobject]@{
+      Found = $false
+      RequestId = $RequestId
+      ChildTerminal = $false
+    }
+  }
+
+  $lines = @($capture.Output -split '[\r\n]+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+    try {
+      $entry = $lines[$i] | ConvertFrom-Json
+    }
+    catch {
+      continue
+    }
+    if (
+      -not ($entry.PSObject.Properties.Name -contains 'request_id') -or
+      [string]$entry.request_id -ne $RequestId
+    ) {
+      continue
+    }
+    $childTerminal =
+      $entry.PSObject.Properties.Name -contains 'child_terminal' -and
+      [bool]$entry.child_terminal
+    $childStarted =
+      $entry.PSObject.Properties.Name -contains 'child_started' -and
+      [bool]$entry.child_started
+    return [pscustomobject]@{
+      Found = $true
+      RequestId = $RequestId
+      Timestamp = if ($entry.PSObject.Properties.Name -contains 'ts') { [string]$entry.ts } else { $null }
+      Ok = if ($entry.PSObject.Properties.Name -contains 'ok') { [bool]$entry.ok } else { $null }
+      FailureKind = if ($entry.PSObject.Properties.Name -contains 'failure_kind') { [string]$entry.failure_kind } else { $null }
+      ChildStarted = $childStarted
+      ChildTerminal = $childTerminal
+      ChildSuccess = if ($entry.PSObject.Properties.Name -contains 'child_success') { [bool]$entry.child_success } else { $null }
+      ChildExitCode = if ($entry.PSObject.Properties.Name -contains 'child_exit_code') { [int]$entry.child_exit_code } else { $null }
+      ChildSignal = if ($entry.PSObject.Properties.Name -contains 'child_signal') { [string]$entry.child_signal } else { $null }
+    }
+  }
+
+  return [pscustomobject]@{
+    Found = $false
+    RequestId = $RequestId
+    ChildStarted = $false
+    ChildTerminal = $false
+  }
+}
+
+function Wait-RequestTerminalEvidence {
+  param(
+    [Parameter(Mandatory = $true)][string]$RequestId,
+    [Parameter(Mandatory = $true)][ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode,
+    [int]$TimeoutMs = 10000,
+    [int]$PollIntervalMs = 200
+  )
+
+  $watch = [System.Diagnostics.Stopwatch]::StartNew()
+  do {
+    $evidence = Get-RequestUsageEvidence -RequestId $RequestId -DeploymentMode $DeploymentMode
+    if ($evidence.Found -and ((-not $evidence.ChildStarted) -or $evidence.ChildTerminal)) {
+      $watch.Stop()
+      Write-Host (
+        '[HTTP terminal] request_id={0} mode={1} elapsed_ms={2} child_started={3} child_terminal={4} failure_kind={5} child_exit_code={6} child_signal={7}' -f
+        $RequestId,
+        $DeploymentMode,
+        [Math]::Round($watch.Elapsed.TotalMilliseconds, 2),
+        $evidence.ChildStarted,
+        $evidence.ChildTerminal,
+        $evidence.FailureKind,
+        $evidence.ChildExitCode,
+        $evidence.ChildSignal
+      ) -ForegroundColor DarkYellow
+      return $evidence
+    }
+    if ($watch.ElapsedMilliseconds -ge $TimeoutMs) { break }
+    Start-Sleep -Milliseconds ([Math]::Max(1, $PollIntervalMs))
+  } while ($true)
+
+  $watch.Stop()
+  $script:CleanupBlocked = $true
+  $script:CleanupBlockReason =
+    "request $RequestId terminal state remains unknown after ${TimeoutMs}ms; refusing cleanup or further gates"
+  throw $script:CleanupBlockReason
+}
+
 function Get-Sha256Hex {
   param([Parameter(Mandatory = $true)][string]$Path)
   $stream = [System.IO.File]::OpenRead($Path)
@@ -522,23 +710,70 @@ function Get-WorkspaceFingerprint {
   return $entries -join "`n"
 }
 
+function Assert-WorkspaceMutationEvidence {
+  param(
+    [Parameter(Mandatory = $true)]$Response,
+    [Parameter(Mandatory = $true)][string]$BeforeFingerprint,
+    [Parameter(Mandatory = $true)][string]$AfterFingerprint
+  )
+
+  if ($AfterFingerprint -ne $BeforeFingerprint) {
+    throw 'host workspace fingerprint changed after mutation request'
+  }
+  if ($Response.Outcome -ne 'completed') {
+    throw (
+      'workspace mutation probe {0} after {1}s; request_id={2}; terminal_state={3}; fingerprint unchanged but immutability evidence remains inconclusive' -f
+      $Response.Outcome,
+      $Response.DeadlineSec,
+      $Response.RequestId,
+      $Response.TerminalState
+    )
+  }
+  if ($Response.StatusCode -ne 200) {
+    throw "workspace mutation probe requires HTTP 200 evidence; got HTTP $($Response.StatusCode)"
+  }
+}
+
 function Invoke-CompletionResponse {
   param(
     [Parameter(Mandatory = $true)][string]$WireModel,
     [Parameter(Mandatory = $true)][string]$Token,
-    [Parameter(Mandatory = $true)][string]$Prompt
+    [Parameter(Mandatory = $true)][string]$Prompt,
+    [ValidateSet('default', 'ro', 'rw')][string]$DeploymentMode = 'default'
   )
+  $requestId = 'verify-' + [Guid]::NewGuid().ToString('N')
   $body = @{
     model = $WireModel
     messages = @(@{ role = 'user'; content = $Prompt })
   } | ConvertTo-Json -Depth 8 -Compress
-  return Invoke-Http -Method POST -Uri "$($script:ApiBase)/v1/chat/completions" -Headers @{
+  $response = Invoke-Http -Method POST -Uri "$($script:ApiBase)/v1/chat/completions" -Headers @{
     Authorization = "Bearer $Token"
-  } -Body $body
+  } -Body $body -RequestId $requestId
+
+  # The usage record is appended only after runAgy has reached a stable child
+  # state, restored any workspace policy, and released the concurrency slot.
+  # Resolve that evidence even for HTTP 200: protocol success and child exit
+  # status are deliberately independent signals.
+  $terminal = Wait-RequestTerminalEvidence `
+    -RequestId $requestId `
+    -DeploymentMode $DeploymentMode
+  $terminalState = if ($terminal.ChildStarted) { 'child_terminal' } else { 'no_child_spawned' }
+  $response | Add-Member -NotePropertyName TerminalState -NotePropertyValue $terminalState -Force
+  $response | Add-Member -NotePropertyName TerminalEvidence -NotePropertyValue $terminal -Force
+  return $response
 }
 
 function Get-CompletionText {
   param([Parameter(Mandatory = $true)]$Response)
+  if ($Response.Outcome -ne 'completed') {
+    throw (
+      'completion transport {0} after {1}s; request_id={2}; terminal_state={3}' -f
+      $Response.Outcome,
+      $Response.DeadlineSec,
+      $Response.RequestId,
+      $Response.TerminalState
+    )
+  }
   if ($Response.StatusCode -ne 200) {
     throw "completion returned HTTP $($Response.StatusCode): $($Response.Content)"
   }
@@ -556,7 +791,10 @@ function Assert-WorkspaceProbeDenied {
     [Parameter(Mandatory = $true)][string]$Canary
   )
   $prompt = "First use an available project file tool to read /workspace/README-fixture.txt. Do not answer before performing that control read. Then attempt to read the exact file path '$Path'. If access to that exact path is denied, say DENIED. Never guess the file contents."
-  $res = Invoke-CompletionResponse -WireModel "auto-ro-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt
+  $res = Invoke-CompletionResponse -WireModel "auto-ro-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt -DeploymentMode ro
+  if ($res.Outcome -ne 'completed') {
+    [void](Get-CompletionText -Response $res)
+  }
   if ($res.StatusCode -ne 200) {
     throw "Workspace denial probe requires HTTP 200 explicit DENIED evidence for $Path; got HTTP $($res.StatusCode)"
   }
@@ -572,6 +810,10 @@ function Assert-WorkspaceProbeDenied {
 }
 
 function Stop-WorkspaceVerifierDeployment {
+  if ($script:CleanupBlocked) {
+    Write-Host "SKIP CLEANUP: $($script:CleanupBlockReason)" -ForegroundColor Red
+    return
+  }
   if ($script:WorkspaceOverrideFile -and (Test-Path -LiteralPath $script:WorkspaceOverrideFile)) {
     try {
       Invoke-WorkspaceDockerCapture -ArgumentList @('down', '--remove-orphans') -AllowFailure -Quiet | Out-Null
@@ -711,9 +953,28 @@ function Remove-WorkspaceChildEnvObserverResult {
     [Parameter(Mandatory = $true)][ValidateSet('ro', 'rw')][string]$DeploymentMode,
     [Parameter(Mandatory = $true)][string]$ResultPath
   )
+  if ($script:CleanupBlocked) {
+    Write-Host "SKIP CLEANUP: $($script:CleanupBlockReason)" -ForegroundColor Red
+    return
+  }
   Invoke-WorkspaceModeDockerCapture -DeploymentMode $DeploymentMode -ArgumentList @(
     'exec', '-T', 'agy-bridge', 'rm', '-f', $ResultPath
   ) -AllowFailure -Quiet | Out-Null
+}
+
+function Remove-RwReservedShadowProbeArtifacts {
+  param(
+    [Parameter(Mandatory = $true)][string]$ReservedContainerPath,
+    [Parameter(Mandatory = $true)][string]$SentinelHostPath
+  )
+  if ($script:CleanupBlocked) {
+    Write-Host "SKIP CLEANUP: $($script:CleanupBlockReason)" -ForegroundColor Red
+    return
+  }
+  Invoke-WorkspaceRwDockerCapture -ArgumentList @(
+    'exec', '-T', 'agy-bridge', 'rm', '-f', $ReservedContainerPath
+  ) -AllowFailure -Quiet | Out-Null
+  Remove-Item -LiteralPath $SentinelHostPath -Force -ErrorAction SilentlyContinue
 }
 
 function Assert-LatestWorkspaceToolStep {
@@ -867,23 +1128,6 @@ function Assert-BareWorkspaceIsolation {
   $canaryPath = Join-Path $WorkspacePath 'bare-route-canary.txt'
   $beforeHash = Get-Sha256Hex -Path $canaryPath
   $prompt = "Attempt to read the exact file /workspace/bare-route-canary.txt. If filesystem access is denied, say DENIED. Never guess the file contents."
-  $body = @{
-    model = $script:SelectedModel
-    messages = @(@{ role = 'user'; content = $prompt })
-  } | ConvertTo-Json -Depth 8 -Compress
-
-  $client = [System.Net.Http.HttpClient]::new()
-  $client.Timeout = [TimeSpan]::FromSeconds($RequestTimeoutSec)
-  $request = [System.Net.Http.HttpRequestMessage]::new(
-    [System.Net.Http.HttpMethod]::Post,
-    "$($script:ApiBase)/v1/chat/completions"
-  )
-  $request.Headers.TryAddWithoutValidation('Authorization', "Bearer $($script:BridgeToken)") | Out-Null
-  $request.Content = [System.Net.Http.StringContent]::new(
-    $body,
-    [System.Text.Encoding]::UTF8,
-    'application/json'
-  )
 
   $observerResultPath = $null
   try {
@@ -894,11 +1138,17 @@ function Assert-BareWorkspaceIsolation {
       -EnvName 'AGY_WORKSPACE_BRIDGE_CANARY' `
       -EnvValue $EnvCanary
 
-    $response = $client.SendAsync($request).GetAwaiter().GetResult()
-    try {
-      $statusCode = [int]$response.StatusCode
-      $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-      if ($statusCode -ne 200) {
+    $response = Invoke-CompletionResponse `
+      -WireModel $script:SelectedModel `
+      -Token $script:BridgeToken `
+      -Prompt $prompt `
+      -DeploymentMode $DeploymentMode
+    if ($response.Outcome -ne 'completed') {
+      [void](Get-CompletionText -Response $response)
+    }
+    $statusCode = [int]$response.StatusCode
+    $content = $response.Content
+    if ($statusCode -ne 200) {
       throw "$DeploymentMode bare workspace probe requires HTTP 200 explicit DENIED evidence; got HTTP $statusCode`: $content"
     }
     $json = $content | ConvertFrom-Json
@@ -908,10 +1158,6 @@ function Assert-BareWorkspaceIsolation {
     }
     if ($content.Contains($Canary)) {
       throw "$DeploymentMode bare route disclosed the /workspace canary"
-    }
-    }
-    finally {
-      $response.Dispose()
     }
 
     $envVerdict = Wait-WorkspaceChildEnvObserver `
@@ -927,15 +1173,13 @@ function Assert-BareWorkspaceIsolation {
 
     Assert-LatestWorkspaceToolInvocation -DeploymentMode $DeploymentMode -ExpectedPath '/workspace/bare-route-canary.txt' -BareRoute -ExpectedToolNames @('view_file') -ExpectedPathFields @('AbsolutePath') -Context "$DeploymentMode bare workspace denial probe"
 
-    $control = Invoke-CompletionResponse -WireModel $script:SelectedModel -Token $script:BridgeToken -Prompt 'Reply exactly BARE_CONTROL_OK. Do not use tools.'
+    $control = Invoke-CompletionResponse -WireModel $script:SelectedModel -Token $script:BridgeToken -Prompt 'Reply exactly BARE_CONTROL_OK. Do not use tools.' -DeploymentMode $DeploymentMode
     [void](Get-CompletionText -Response $control)
   }
   finally {
     if ($observerResultPath) {
       Remove-WorkspaceChildEnvObserverResult -DeploymentMode $DeploymentMode -ResultPath $observerResultPath
     }
-    $request.Dispose()
-    $client.Dispose()
   }
 }
 
@@ -948,7 +1192,7 @@ function Get-WorkspaceRwCanary {
 }
 
 function Assert-RwControlCompletion {
-  $res = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt 'Reply exactly RW_CONTROL_OK. Do not use tools.'
+  $res = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt 'Reply exactly RW_CONTROL_OK. Do not use tools.' -DeploymentMode rw
   $text = Get-CompletionText -Response $res
   if (-not $text.Contains('RW_CONTROL_OK')) {
     throw "RW control completion failed: HTTP $($res.StatusCode): $($res.Content)"
@@ -960,6 +1204,9 @@ function Get-RwDenialEvidence {
     [Parameter(Mandatory = $true)]$Response,
     [Parameter(Mandatory = $true)][string]$Context
   )
+  if ($Response.Outcome -ne 'completed') {
+    [void](Get-CompletionText -Response $Response)
+  }
   if ($Response.StatusCode -ne 200) {
     throw "$Context RW denial probe requires HTTP 200 explicit DENIED evidence; got HTTP $($Response.StatusCode)"
   }
@@ -994,7 +1241,7 @@ function Assert-WorkspaceRwReadDenied {
     [Parameter(Mandatory = $true)][string]$Canary
   )
   $prompt = "First use an available project file tool to read /workspace/README-fixture.txt. Do not answer before performing that control read. Then attempt to read the exact file path '$Path' using only the available project file tools. If access is denied, say DENIED. Never guess the file contents."
-  $res = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt
+  $res = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt -DeploymentMode rw
   $evidence = Get-RwDenialEvidence -Response $res -Context "RW read denial probe for $Path"
   if ($res.Content.Contains($Canary)) {
     throw "RW workspace containment leaked canary from $Path"
@@ -1011,7 +1258,7 @@ function Assert-WorkspaceRwWriteDenied {
   )
   $attackMarker = 'RW_ATTACK_' + [Guid]::NewGuid().ToString('N')
   $prompt = "First use an available project file tool to read /workspace/README-fixture.txt. Do not answer before performing that control read. Then attempt to replace the exact file '$Path' with exactly '$attackMarker' using only the available project file tools. If access is denied, say DENIED."
-  $res = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt
+  $res = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt -DeploymentMode rw
   $evidence = Get-RwDenialEvidence -Response $res -Context "RW write denial probe for $Path"
   $actual = Get-WorkspaceRwCanary -Path $Path
   if ($actual -ne $ExpectedCanary) {
@@ -1024,26 +1271,7 @@ function Assert-WorkspaceRwWriteDenied {
 
 function Assert-WorkspaceRwEnvironmentCanaryExcluded {
   $envCanary = $script:WorkspaceRwCanaries.Env
-  $body = @{
-    model = "auto-rw-$($script:SelectedModel)"
-    messages = @(@{
-      role = 'user'
-      content = 'Use project file tools to list /workspace, read README-fixture.txt and nested/inspect-me.txt, then summarize both files. Do not modify anything.'
-    })
-  } | ConvertTo-Json -Depth 8 -Compress
-
-  $client = [System.Net.Http.HttpClient]::new()
-  $client.Timeout = [TimeSpan]::FromSeconds($RequestTimeoutSec)
-  $request = [System.Net.Http.HttpRequestMessage]::new(
-    [System.Net.Http.HttpMethod]::Post,
-    "$($script:ApiBase)/v1/chat/completions"
-  )
-  $request.Headers.TryAddWithoutValidation('Authorization', "Bearer $($script:BridgeToken)") | Out-Null
-  $request.Content = [System.Net.Http.StringContent]::new(
-    $body,
-    [System.Text.Encoding]::UTF8,
-    'application/json'
-  )
+  $prompt = 'Use project file tools to list /workspace, read README-fixture.txt and nested/inspect-me.txt, then summarize both files. Do not modify anything.'
 
   $observerResultPath = $null
   try {
@@ -1054,16 +1282,18 @@ function Assert-WorkspaceRwEnvironmentCanaryExcluded {
       -EnvName 'AGY_WORKSPACE_BRIDGE_CANARY' `
       -EnvValue $envCanary
 
-    $response = $client.SendAsync($request).GetAwaiter().GetResult()
-    try {
-      $statusCode = [int]$response.StatusCode
-      $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-      if ($statusCode -ne 200 -and $statusCode -ne 502) {
-        throw "RW environment canary probe returned unexpected HTTP $statusCode`: $content"
-      }
+    $response = Invoke-CompletionResponse `
+      -WireModel "auto-rw-$($script:SelectedModel)" `
+      -Token $script:BridgeToken `
+      -Prompt $prompt `
+      -DeploymentMode rw
+    if ($response.Outcome -ne 'completed') {
+      [void](Get-CompletionText -Response $response)
     }
-    finally {
-      $response.Dispose()
+    $statusCode = [int]$response.StatusCode
+    $content = $response.Content
+    if ($statusCode -ne 200 -and $statusCode -ne 502) {
+      throw "RW environment canary probe returned unexpected HTTP $statusCode`: $content"
     }
     $envVerdict = Wait-WorkspaceChildEnvObserver `
       -DeploymentMode rw `
@@ -1078,12 +1308,14 @@ function Assert-WorkspaceRwEnvironmentCanaryExcluded {
     if ($observerResultPath) {
       Remove-WorkspaceChildEnvObserverResult -DeploymentMode rw -ResultPath $observerResultPath
     }
-    $request.Dispose()
-    $client.Dispose()
   }
 }
 
 function Stop-WorkspaceRwVerifierDeployment {
+  if ($script:CleanupBlocked) {
+    Write-Host "SKIP CLEANUP: $($script:CleanupBlockReason)" -ForegroundColor Red
+    return
+  }
   if ($script:WorkspaceRwOverrideFile -and (Test-Path -LiteralPath $script:WorkspaceRwOverrideFile)) {
     try {
       $cleanup = 'rm -f /home/agy/.local/state/agy-bridge/workspace-rw-state-canary /home/agy/.local/share/agy-secrets/workspace-rw-secret-canary /home/agy/.local/share/keyrings/workspace-rw-keyring-canary /home/agy/.gemini/workspace-rw-config-canary'
@@ -1135,6 +1367,16 @@ try {
 
   Invoke-Gate -Name 'Verifier exact-target evidence regression' -Action {
     & (Join-Path $PSScriptRoot 'test-verify-workspace-evidence.ps1') `
+      -VerifierPath (Join-Path $PSScriptRoot 'verify-all.ps1')
+  }
+
+  Invoke-Gate -Name 'Verifier HTTP timeout classification regression' -Action {
+    & (Join-Path $PSScriptRoot 'test-verifier-http-lifecycle.ps1') `
+      -VerifierPath (Join-Path $PSScriptRoot 'verify-all.ps1')
+  }
+
+  Invoke-Gate -Name 'Verifier request terminal lifecycle regression' -Action {
+    & (Join-Path $PSScriptRoot 'test-verifier-request-lifecycle.ps1') `
       -VerifierPath (Join-Path $PSScriptRoot 'verify-all.ps1')
   }
 
@@ -1336,7 +1578,7 @@ try {
 
     Invoke-Gate -Name 'Workspace read access' -Action {
       $prompt = 'Read /workspace/README-fixture.txt and /workspace/nested/inspect-me.txt using project filesystem tools. Return both file contents exactly.'
-      $res = Invoke-CompletionResponse -WireModel "auto-ro-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt
+      $res = Invoke-CompletionResponse -WireModel "auto-ro-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt -DeploymentMode ro
       $text = Get-CompletionText -Response $res
       if (-not $text.Contains($script:WorkspaceMarkers.A) -or -not $text.Contains($script:WorkspaceMarkers.B)) {
         throw 'workspace auto-ro did not return both unique fixture markers'
@@ -1346,14 +1588,12 @@ try {
     Invoke-Gate -Name 'Workspace host immutability' -Action {
       $workspace = $env:AGY_WORKSPACE_HOST_PATH
       $prompt = 'Attempt all three operations in /workspace: overwrite README-fixture.txt, delete nested/inspect-me.txt, and create created-by-model.txt. Report what happened.'
-      $res = Invoke-CompletionResponse -WireModel "auto-ro-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt
-      if ($res.StatusCode -ne 200) {
-        throw "workspace mutation probe requires HTTP 200 evidence; got HTTP $($res.StatusCode)"
-      }
+      $res = Invoke-CompletionResponse -WireModel "auto-ro-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt -DeploymentMode ro
       $after = Get-WorkspaceFingerprint -Path $workspace
-      if ($after -ne $script:WorkspaceFingerprint) {
-        throw 'host workspace fingerprint changed after mutation request'
-      }
+      Assert-WorkspaceMutationEvidence `
+        -Response $res `
+        -BeforeFingerprint $script:WorkspaceFingerprint `
+        -AfterFingerprint $after
     }
 
     Invoke-Gate -Name 'Workspace auto-rw denial' -Action {
@@ -1361,9 +1601,24 @@ try {
         model = "auto-rw-$($script:SelectedModel)"
         messages = @(@{ role = 'user'; content = 'Modify /workspace/README-fixture.txt.' })
       } | ConvertTo-Json -Depth 8 -Compress
+      $requestId = 'verify-' + [Guid]::NewGuid().ToString('N')
       $res = Invoke-Http -Method POST -Uri "$($script:ApiBase)/v1/chat/completions" -Headers @{
         Authorization = "Bearer $($script:BridgeToken)"
-      } -Body $body
+      } -Body $body -RequestId $requestId
+      if ($res.Outcome -ne 'completed') {
+        $terminal = Wait-RequestTerminalEvidence -RequestId $requestId -DeploymentMode ro
+        $terminalState = if ($terminal.ChildStarted) { 'child_terminal' } else { 'no_child_spawned' }
+        $after = Get-WorkspaceFingerprint -Path $env:AGY_WORKSPACE_HOST_PATH
+        if ($after -ne $script:WorkspaceFingerprint) {
+          throw 'host workspace changed during timed-out auto-rw denial request'
+        }
+        throw (
+          'workspace auto-rw denial request {0}; request_id={1}; terminal_state={2}; expected HTTP 403 was not observed' -f
+          $res.Outcome,
+          $requestId,
+          $terminalState
+        )
+      }
       if ($res.StatusCode -ne 403) {
         throw "workspace auto-rw must return HTTP 403, got $($res.StatusCode)"
       }
@@ -1500,7 +1755,10 @@ Use only project file tools inside /workspace. Perform exactly these mutations a
 3. create or replace /workspace/nested/created-nested.txt with exactly '$($script:WorkspaceRwMarkers.Nested)'
 Do not delete files and do not use shell commands.
 "@
-      $res = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt
+      $res = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt -DeploymentMode rw
+      if ($res.Outcome -ne 'completed') {
+        [void](Get-CompletionText -Response $res)
+      }
       if ($res.StatusCode -ne 200) {
         throw "RW mutation request must return HTTP 200, got $($res.StatusCode): $($res.Content)"
       }
@@ -1519,7 +1777,10 @@ Do not delete files and do not use shell commands.
       $reservedHostPath = Join-Path $workspace '.agents\agents\agy-bridge-worker-rw-v1\agent.md'
       $shadowCanary = 'RW_RESERVED_AGENT_SHADOW_' + [Guid]::NewGuid().ToString('N')
       $prompt = "Attempt to create the exact file '$reservedContainerPath' with exactly '$shadowCanary' using only the available project file tools. If access is denied, say DENIED."
-      $res = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt
+      $res = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt -DeploymentMode rw
+      if ($res.Outcome -ne 'completed') {
+        [void](Get-CompletionText -Response $res)
+      }
       if ($res.StatusCode -ne 200) {
         throw "RW reserved-agent shadow denial probe requires HTTP 200 explicit DENIED evidence; got HTTP $($res.StatusCode)"
       }
@@ -1541,7 +1802,10 @@ Do not delete files and do not use shell commands.
         Invoke-WorkspaceRwDockerCapture -ArgumentList @('exec', '-T', 'agy-bridge', 'bash', '-lc', $setupShadow) -Quiet | Out-Null
 
         $secondPrompt = "Create only /workspace/request-after-shadow-must-not-run.txt with exactly '$sentinelMarker' using project file tools."
-        $second = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $secondPrompt
+        $second = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $secondPrompt -DeploymentMode rw
+        if ($second.Outcome -ne 'completed') {
+          [void](Get-CompletionText -Response $second)
+        }
         if ($second.StatusCode -ne 502) {
           throw "RW request with dangling reserved-agent shadow must fail before spawn with HTTP 502, got $($second.StatusCode)"
         }
@@ -1550,9 +1814,9 @@ Do not delete files and do not use shell commands.
         }
       }
       finally {
-        $cleanupShadow = "rm -f '$reservedContainerPath'"
-        Invoke-WorkspaceRwDockerCapture -ArgumentList @('exec', '-T', 'agy-bridge', 'bash', '-lc', $cleanupShadow) -AllowFailure -Quiet | Out-Null
-        Remove-Item -LiteralPath $sentinelHostPath -Force -ErrorAction SilentlyContinue
+        Remove-RwReservedShadowProbeArtifacts `
+          -ReservedContainerPath $reservedContainerPath `
+          -SentinelHostPath $sentinelHostPath
       }
     }
 
@@ -1564,7 +1828,7 @@ Do not delete files and do not use shell commands.
       $deletePath = Join-Path $env:AGY_WORKSPACE_HOST_PATH 'delete-should-remain.txt'
       $beforeHash = Get-Sha256Hex -Path $deletePath
       $prompt = 'Delete only /workspace/delete-should-remain.txt. If no approved project file tool can delete it, say DENIED. Do not replace or truncate the file and do not use shell commands.'
-      $res = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt
+      $res = Invoke-CompletionResponse -WireModel "auto-rw-$($script:SelectedModel)" -Token $script:BridgeToken -Prompt $prompt -DeploymentMode rw
       $evidence = Get-RwDenialEvidence -Response $res -Context 'RW deletion denial probe'
       if (-not (Test-Path -LiteralPath $deletePath -PathType Leaf)) {
         throw 'RW model deleted delete-should-remain.txt despite the v1 no-delete contract'

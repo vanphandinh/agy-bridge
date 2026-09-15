@@ -219,6 +219,17 @@ async function appendUsage(entry: Record<string, unknown>) {
   }
 }
 
+function requestCorrelationLog(req: Request): Record<string, string> {
+  const requestId = req.headers.get("x-agy-request-id");
+  if (
+    requestId &&
+    /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestId)
+  ) {
+    return { request_id: requestId };
+  }
+  return {};
+}
+
 // ---------- concurrency gate ----------
 
 let active = 0;
@@ -741,8 +752,10 @@ async function runAgy(
   let onAbort: (() => void) | null = null;
   let abortListenerAdded = false;
   let workspacePolicyApplied = false;
-  let workspaceChildStatus: Promise<Deno.CommandStatus> | null = null;
-  let workspaceChildKill: (() => void) | null = null;
+  let childStatusForCleanup: Promise<Deno.CommandStatus> | null = null;
+  let childKillForCleanup: (() => void) | null = null;
+  let childStarted = false;
+  let childTerminalStatus: Deno.CommandStatus | null = null;
   let toolStepUpdates = 0;
   const workspace = execution.workspace;
 
@@ -791,13 +804,14 @@ async function runAgy(
       env: workspace ? workspaceChildEnv() : childEnv(),
       clearEnv: true,
     }).spawn();
+    childStarted = true;
 
     // Start draining and arm termination machinery before any child I/O can
     // block. In particular, a multi-megabyte stdin write can fill the pipe if
     // agy keeps stdin open but never reads it.
     const stderrText = new Response(child.stderr).text().catch(() => "");
     const statusPromise = child.status;
-    if (workspace) workspaceChildStatus = statusPromise;
+    childStatusForCleanup = statusPromise;
     let exited = false;
     let escalateTimer: ReturnType<typeof setTimeout> | null = null;
     const clearEscalation = () => {
@@ -807,7 +821,13 @@ async function runAgy(
         escalateTimer = null;
       }
     };
-    void statusPromise.then(clearEscalation, clearEscalation);
+    void statusPromise.then(
+      (status) => {
+        childTerminalStatus = status;
+        clearEscalation();
+      },
+      clearEscalation,
+    );
 
     const killHard = () => {
       if (exited) return;
@@ -815,9 +835,9 @@ async function runAgy(
         child.kill("SIGTERM");
       } catch { /* already dead */ }
       if (escalateTimer === null) {
-        // Default runs may release their request gate before this escalation.
-        // Workspace runs wait for child.status before restoring policy and
-        // releasing the concurrency slot.
+        // Every run now waits for child.status before releasing the
+        // concurrency slot; workspace runs additionally restore policy only
+        // after that same terminal-state barrier.
         escalateTimer = setTimeout(() => {
           if (!exited) {
             try {
@@ -827,7 +847,7 @@ async function runAgy(
         }, 3_000);
       }
     };
-    if (workspace) workspaceChildKill = killHard;
+    childKillForCleanup = killHard;
 
     let resolveAbort: ((value: "aborted") => void) | null = null;
     const abortPromise = signal
@@ -927,6 +947,7 @@ async function runAgy(
         }
       }
       const status = await statusPromise;
+      childTerminalStatus = status;
       if (!terminalEarly && !result.ok && !result.error) {
         const errText = await stderrText;
         result.error = errText.trim() || `agy exited with code ${status.code}`;
@@ -1000,13 +1021,13 @@ async function runAgy(
     if (signal && onAbort && abortListenerAdded) {
       signal.removeEventListener("abort", onAbort);
     }
-    if (workspacePolicyApplied && workspaceChildStatus) {
-      workspaceChildKill?.();
+    if (childStatusForCleanup) {
+      childKillForCleanup?.();
       try {
-        await workspaceChildStatus;
+        childTerminalStatus = await childStatusForCleanup;
       } catch {
-        // The containment invariant needs terminal process state, not a
-        // successful exit code. runAgy records the actual request failure.
+        // Cleanup needs terminal process state, not a successful exit code.
+        // runAgy records the actual request failure independently.
       }
     }
     if (workspacePolicyApplied) {
@@ -1030,6 +1051,16 @@ async function runAgy(
       conversation_id: result.conversationId,
       tokens: result.usage,
       error: result.error,
+      failure_kind: result.failureKind,
+      child_started: childStarted,
+      child_terminal: childTerminalStatus !== null,
+      ...(childTerminalStatus
+        ? {
+          child_success: childTerminalStatus.success,
+          child_exit_code: childTerminalStatus.code,
+          child_signal: childTerminalStatus.signal,
+        }
+        : {}),
       tool_step_updates: toolStepUpdates,
       ...(recoveredSalvage ? { recovered: true } : {}),
       ...(handlers.log ?? {}),
@@ -1124,6 +1155,7 @@ async function handleAutonomousChat(
     workspaceContract,
   );
   const log = {
+    ...requestCorrelationLog(req),
     autonomous: auto.profile,
     agent: selectedAgent,
     ...(workspace
@@ -1294,6 +1326,7 @@ async function handleChat(req: Request): Promise<Response> {
   const useTools = TOOLS_ENABLED && (body.tools?.length ?? 0) > 0;
   const bareExecution = bareExecutionContext();
   const log = {
+    ...requestCorrelationLog(req),
     continued: prepared.continued,
     msgs: body.messages?.length ?? 0,
     prompt_chars: prompt.length,

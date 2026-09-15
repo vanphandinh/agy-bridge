@@ -111,6 +111,7 @@ try {
     $_ -ne 'docs/superpowers/plans/2026-09-14-read-write-host-workspace-pr4.md' -and
     $_ -ne 'docs/superpowers/specs/2026-09-13-read-write-host-workspace-design.md' -and
     $_ -ne 'docs/docker-compose.md' -and
+    $_ -ne 'tests/service.test.ts' -and
     $_ -notmatch '^docker/tests/'
   })
   if ($disallowedPaths.Count -gt 0) {

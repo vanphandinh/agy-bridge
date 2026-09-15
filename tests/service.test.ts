@@ -423,6 +423,159 @@ done
   }
 });
 
+Deno.test("request correlation records actual child terminal status independently from protocol success", async () => {
+  const mockScript = `#!/usr/bin/env bash
+if [ "$1" = "models" ]; then
+  printf "gemini-2.5-pro\\tGemini 2.5 Pro\\n"
+  exit 0
+fi
+
+read -r line
+printf '{"event":"result","result":{"status":"SUCCESS","response":"protocol success before nonzero exit","conversation_id":"terminal-evidence","usage":{"input_tokens":2,"output_tokens":1}}}\\n'
+exit 7
+`;
+  const harness = await ServiceHarness.create({ mockAgyScript: mockScript });
+  const requestId = "verify-terminal-evidence-001";
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${harness.port}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Agy-Request-Id": requestId,
+        },
+        body: JSON.stringify({
+          model: "gemini-2.5-pro",
+          messages: [{ role: "user", content: "return the mock result" }],
+        }),
+      },
+    );
+    assertEquals(response.status, 200);
+
+    const usageText = await Deno.readTextFile(`${harness.stateDir}/usage.jsonl`);
+    const usage = JSON.parse(usageText.trim().split("\n").at(-1)!);
+    assertEquals(usage.request_id, requestId);
+    assertEquals(usage.ok, true);
+    assertEquals(usage.child_started, true);
+    assertEquals(usage.child_terminal, true);
+    assertEquals(usage.child_exit_code, 7);
+    assertEquals(usage.child_success, false);
+  } finally {
+    await harness.close();
+  }
+});
+
+Deno.test("client abort keeps concurrency held until a SIGTERM-resistant child is terminal", async () => {
+  const mockScript = `#!/usr/bin/env bash
+set -euo pipefail
+if [ "\${1:-}" = "models" ]; then
+  printf "gemini-2.5-pro\\tGemini 2.5 Pro\\n"
+  exit 0
+fi
+
+count_file="$HOME/abort-terminal-count"
+count=0
+if [ -f "$count_file" ]; then
+  count="$(cat "$count_file")"
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+read -r line
+
+if [ "$count" -eq 1 ]; then
+  printf '%s' "$$" > "$HOME/abort-terminal.pid"
+  printf 'started' > "$HOME/abort-terminal-started"
+  trap '' TERM
+  while true; do sleep 1; done
+fi
+
+printf '{"event":"result","result":{"status":"SUCCESS","response":"second after terminal","conversation_id":"after-terminal","usage":{"input_tokens":1,"output_tokens":1}}}\\n'
+exit 0
+`;
+  const harness = await ServiceHarness.create({ mockAgyScript: mockScript });
+  try {
+    const abortController = new AbortController();
+    const firstPromise = fetch(
+      `http://127.0.0.1:${harness.port}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: abortController.signal,
+        body: JSON.stringify({
+          model: "gemini-2.5-pro",
+          messages: [{ role: "user", content: "hang until aborted" }],
+        }),
+      },
+    );
+
+    const startedPath = `${harness.homeDir}/abort-terminal-started`;
+    const startedDeadline = Date.now() + 3_000;
+    while (true) {
+      try {
+        await Deno.stat(startedPath);
+        break;
+      } catch {
+        if (Date.now() >= startedDeadline) {
+          throw new Error("first child did not start");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+
+    abortController.abort();
+    await firstPromise.catch(() => undefined);
+
+    const secondPromise = fetch(
+      `http://127.0.0.1:${harness.port}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(7_000),
+        body: JSON.stringify({
+          model: "gemini-2.5-pro",
+          messages: [{ role: "user", content: "run only after first terminal" }],
+        }),
+      },
+    );
+
+    // SIGKILL escalation is 3s. Half a second after abort, the first child is
+    // intentionally still alive, so MAX_CONCURRENT=1 must still exclude the
+    // second child.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assertEquals(
+      await Deno.readTextFile(`${harness.homeDir}/abort-terminal-count`),
+      "1",
+    );
+
+    const second = await secondPromise;
+    assertEquals(second.status, 200);
+    const secondBody = await second.json();
+    assertEquals(secondBody.choices[0].message.content, "second after terminal");
+
+    const usageDeadline = Date.now() + 2_000;
+    let rows: Array<Record<string, unknown>> = [];
+    while (Date.now() < usageDeadline) {
+      try {
+        rows = (await Deno.readTextFile(`${harness.stateDir}/usage.jsonl`))
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line));
+        if (rows.length >= 2) break;
+      } catch { /* usage log not ready yet */ }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assertEquals(rows.length, 2);
+    assertEquals(rows[0].failure_kind, "aborted");
+    assertEquals(rows[0].child_started, true);
+    assertEquals(rows[0].child_terminal, true);
+    assertEquals(rows[0].child_success, false);
+  } finally {
+    await harness.close();
+  }
+});
+
 Deno.test("Task 6.3: Salvage recovers final response from transcript when agy exits with error", async () => {
   const convId = "salvage-test-conv";
   // Mock agy that exits with status ERROR but leaves transcript
