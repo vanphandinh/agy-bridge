@@ -46,6 +46,31 @@ foreach ($call in $completionHttpCalls) {
   }
 }
 
+# The expected RO auto-rw rejection must consume its correlated usage row even
+# when HTTP 403 is returned normally. Merely attaching a request id is not
+# enough to prove the rejection happened before agy was spawned.
+$autoRwDenialGate = $ast.Find({
+  param($candidate)
+  $candidate -is [System.Management.Automation.Language.CommandAst] -and
+    $candidate.GetCommandName() -eq 'Invoke-Gate' -and
+    $candidate.Extent.Text -match "Workspace auto-rw denial"
+}, $true)
+if ($null -eq $autoRwDenialGate) {
+  Fail 'verifier is missing Workspace auto-rw denial gate'
+}
+$autoRwDenialText = $autoRwDenialGate.Extent.Text
+$outcomeBranchIndex = $autoRwDenialText.IndexOf("if (`$res.Outcome -ne 'completed')")
+$terminalWaitIndex = $autoRwDenialText.IndexOf('Wait-RequestTerminalEvidence')
+if ($outcomeBranchIndex -lt 0 -or $terminalWaitIndex -lt 0 -or $terminalWaitIndex -gt $outcomeBranchIndex) {
+  Fail 'Workspace auto-rw denial does not resolve correlated terminal evidence before classifying the HTTP outcome'
+}
+if (
+  $autoRwDenialText -notmatch '(?i)\$terminal\.ChildStarted' -or
+  $autoRwDenialText -notmatch '(?i)\$terminal\.FailureKind\s+-ne\s+''rejected'''
+) {
+  Fail 'Workspace auto-rw denial does not prove the correlated request was rejected before child spawn'
+}
+
 function Import-VerifierFunction {
   param([Parameter(Mandatory = $true)][string]$Name)
   $node = $ast.Find({

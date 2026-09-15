@@ -1793,9 +1793,17 @@ try {
       $res = Invoke-Http -Method POST -Uri "$($script:ApiBase)/v1/chat/completions" -Headers @{
         Authorization = "Bearer $($script:BridgeToken)"
       } -Body $body -RequestId $requestId
+      $terminal = Wait-RequestTerminalEvidence -RequestId $requestId -DeploymentMode ro
+      $terminalState = if ($terminal.ChildStarted) { 'child_terminal' } else { 'no_child_spawned' }
+      if ($terminal.ChildStarted -or $terminal.FailureKind -ne 'rejected') {
+        throw (
+          'workspace auto-rw denial did not prove pre-spawn rejection; request_id={0}; terminal_state={1}; failure_kind={2}' -f
+          $requestId,
+          $terminalState,
+          $terminal.FailureKind
+        )
+      }
       if ($res.Outcome -ne 'completed') {
-        $terminal = Wait-RequestTerminalEvidence -RequestId $requestId -DeploymentMode ro
-        $terminalState = if ($terminal.ChildStarted) { 'child_terminal' } else { 'no_child_spawned' }
         $after = Get-WorkspaceFingerprint -Path $env:AGY_WORKSPACE_HOST_PATH
         if ($after -ne $script:WorkspaceFingerprint) {
           throw 'host workspace changed during timed-out auto-rw denial request'
