@@ -78,14 +78,14 @@ required=(
   "'exec', '-T', '-d', 'agy-bridge'"
   "[ValidateSet('ro', 'rw')][string]\$DeploymentMode"
   'tool_step_updates'
-  'Assert-LatestWorkspaceToolStep -DeploymentMode ro -Context "RO read denial probe for $Path"'
-  'Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context "RW read denial probe for $Path"'
-  'Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context "RW write denial probe for $Path"'
-  "Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context 'RW reserved-agent shadow denial probe'"
-  'Assert-LatestWorkspaceToolInvocation -DeploymentMode ro -ExpectedPath $Path'
-  'Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -ExpectedPath $Path'
-  'Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -ExpectedPath $reservedContainerPath'
-  "Assert-LatestWorkspaceToolInvocation -DeploymentMode \$DeploymentMode -ExpectedPath '/workspace/bare-route-canary.txt' -BareRoute"
+  'Assert-LatestWorkspaceToolStep -DeploymentMode ro -UsageEvidence $res.TerminalEvidence -Context "RO read denial probe for $Path"'
+  'Assert-LatestWorkspaceToolStep -DeploymentMode rw -UsageEvidence $res.TerminalEvidence -Context "RW read denial probe for $Path"'
+  'Assert-LatestWorkspaceToolStep -DeploymentMode rw -UsageEvidence $res.TerminalEvidence -Context "RW write denial probe for $Path"'
+  "Assert-LatestWorkspaceToolStep -DeploymentMode rw -UsageEvidence \$res.TerminalEvidence -Context 'RW reserved-agent shadow denial probe'"
+  'Assert-LatestWorkspaceToolInvocation -DeploymentMode ro -UsageEvidence $res.TerminalEvidence -ExpectedPath $Path'
+  'Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -UsageEvidence $res.TerminalEvidence -ExpectedPath $Path'
+  'Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -UsageEvidence $res.TerminalEvidence -ExpectedPath $reservedContainerPath'
+  "Assert-LatestWorkspaceToolInvocation -DeploymentMode \$DeploymentMode -UsageEvidence \$response.TerminalEvidence -ExpectedPath '/workspace/bare-route-canary.txt' -BareRoute"
   'did not reach a native tool step'
   'did not record a native tool invocation for the exact denied path'
   'Workspace denial probe requires HTTP 200 explicit DENIED evidence'
