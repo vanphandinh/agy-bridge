@@ -629,6 +629,10 @@ function Get-RequestUsageEvidence {
       ChildSuccess = if ($entry.PSObject.Properties.Name -contains 'child_success') { [bool]$entry.child_success } else { $null }
       ChildExitCode = if ($entry.PSObject.Properties.Name -contains 'child_exit_code') { [int]$entry.child_exit_code } else { $null }
       ChildSignal = if ($entry.PSObject.Properties.Name -contains 'child_signal') { [string]$entry.child_signal } else { $null }
+      ConversationId = if ($entry.PSObject.Properties.Name -contains 'conversation_id') { [string]$entry.conversation_id } else { $null }
+      ToolStepUpdates = if ($entry.PSObject.Properties.Name -contains 'tool_step_updates') { [int]$entry.tool_step_updates } else { $null }
+      Autonomous = if ($entry.PSObject.Properties.Name -contains 'autonomous') { [string]$entry.autonomous } else { $null }
+      Agent = if ($entry.PSObject.Properties.Name -contains 'agent') { [string]$entry.agent } else { $null }
     }
   }
 
@@ -805,8 +809,8 @@ function Assert-WorkspaceProbeDenied {
   if ($res.Content.Contains($Canary)) {
     throw "workspace containment leaked canary from $Path"
   }
-  Assert-LatestWorkspaceToolStep -DeploymentMode ro -Context "RO read denial probe for $Path"
-  Assert-LatestWorkspaceToolInvocation -DeploymentMode ro -ExpectedPath $Path -ExpectedToolNames @('view_file') -ExpectedPathFields @('AbsolutePath') -Context "RO read denial probe for $Path"
+  Assert-LatestWorkspaceToolStep -DeploymentMode ro -UsageEvidence $res.TerminalEvidence -Context "RO read denial probe for $Path"
+  Assert-LatestWorkspaceToolInvocation -DeploymentMode ro -UsageEvidence $res.TerminalEvidence -ExpectedPath $Path -ExpectedToolNames @('view_file') -ExpectedPathFields @('AbsolutePath') -Context "RO read denial probe for $Path"
 }
 
 function Stop-WorkspaceVerifierDeployment {
@@ -980,28 +984,13 @@ function Remove-RwReservedShadowProbeArtifacts {
 function Assert-LatestWorkspaceToolStep {
   param(
     [Parameter(Mandatory = $true)][ValidateSet('ro', 'rw')][string]$DeploymentMode,
+    [Parameter(Mandatory = $true)]$UsageEvidence,
     [Parameter(Mandatory = $true)][string]$Context
   )
-
-  $captureArgs = @(
-    'exec', '-T', 'agy-bridge', 'tail', '-n', '1',
-    '/home/agy/.local/state/agy-bridge/usage.jsonl'
-  )
-  $usageLine = if ($DeploymentMode -eq 'ro') {
-    (Invoke-WorkspaceDockerCapture -ArgumentList $captureArgs -Quiet).Output.Trim()
+  if (-not $UsageEvidence.Found) {
+    throw "$Context has no correlated bridge usage entry to prove native tool activity"
   }
-  else {
-    (Invoke-WorkspaceRwDockerCapture -ArgumentList $captureArgs -Quiet).Output.Trim()
-  }
-  if ([string]::IsNullOrWhiteSpace($usageLine)) {
-    throw "$Context has no bridge usage entry to prove native tool activity"
-  }
-
-  $usage = $usageLine | ConvertFrom-Json
-  if (
-    -not ($usage.PSObject.Properties.Name -contains 'tool_step_updates') -or
-    [int]$usage.tool_step_updates -lt 1
-  ) {
+  if ($null -eq $UsageEvidence.ToolStepUpdates -or [int]$UsageEvidence.ToolStepUpdates -lt 1) {
     throw "$Context did not reach a native tool step"
   }
   $expectedAgent = if ($DeploymentMode -eq 'ro') {
@@ -1010,7 +999,7 @@ function Assert-LatestWorkspaceToolStep {
   else {
     'agy-bridge-worker-rw-v1'
   }
-  if ([string]$usage.autonomous -ne $DeploymentMode -or [string]$usage.agent -ne $expectedAgent) {
+  if ([string]$UsageEvidence.Autonomous -ne $DeploymentMode -or [string]$UsageEvidence.Agent -ne $expectedAgent) {
     throw "$Context tool evidence came from the wrong autonomous profile or agent"
   }
 }
@@ -1018,6 +1007,7 @@ function Assert-LatestWorkspaceToolStep {
 function Assert-LatestWorkspaceToolInvocation {
   param(
     [Parameter(Mandatory = $true)][ValidateSet('ro', 'rw')][string]$DeploymentMode,
+    [Parameter(Mandatory = $true)]$UsageEvidence,
     [Parameter(Mandatory = $true)][string]$ExpectedPath,
     [Parameter(Mandatory = $true)][string[]]$ExpectedToolNames,
     [Parameter(Mandatory = $true)][string[]]$ExpectedPathFields,
@@ -1025,24 +1015,11 @@ function Assert-LatestWorkspaceToolInvocation {
     [Parameter(Mandatory = $true)][string]$Context
   )
 
-  $usageCaptureArgs = @(
-    'exec', '-T', 'agy-bridge', 'tail', '-n', '1',
-    '/home/agy/.local/state/agy-bridge/usage.jsonl'
-  )
-  $usageLine = (Invoke-WorkspaceModeDockerCapture `
-    -DeploymentMode $DeploymentMode `
-    -ArgumentList $usageCaptureArgs `
-    -Quiet).Output.Trim()
-  if ([string]::IsNullOrWhiteSpace($usageLine)) {
-    throw "$Context has no bridge usage entry to locate native tool evidence"
+  if (-not $UsageEvidence.Found) {
+    throw "$Context has no correlated bridge usage entry to locate native tool evidence"
   }
-
-  $usage = $usageLine | ConvertFrom-Json
   if ($BareRoute) {
-    if (
-      ($usage.PSObject.Properties.Name -contains 'autonomous' -and $null -ne $usage.autonomous) -or
-      ($usage.PSObject.Properties.Name -contains 'agent' -and $null -ne $usage.agent)
-    ) {
+    if ($UsageEvidence.Autonomous -or $UsageEvidence.Agent) {
       throw "$Context tool invocation evidence came from an autonomous workspace route instead of the bare route"
     }
   }
@@ -1053,12 +1030,12 @@ function Assert-LatestWorkspaceToolInvocation {
     else {
       'agy-bridge-worker-rw-v1'
     }
-    if ([string]$usage.autonomous -ne $DeploymentMode -or [string]$usage.agent -ne $expectedAgent) {
+    if ([string]$UsageEvidence.Autonomous -ne $DeploymentMode -or [string]$UsageEvidence.Agent -ne $expectedAgent) {
       throw "$Context tool invocation evidence came from the wrong autonomous profile or agent"
     }
   }
 
-  $conversationId = [string]$usage.conversation_id
+  $conversationId = [string]$UsageEvidence.ConversationId
   $parsedConversationId = [Guid]::Empty
   if (-not [Guid]::TryParse($conversationId, [ref]$parsedConversationId)) {
     throw "$Context usage entry has no valid conversation_id for transcript evidence"
@@ -1171,7 +1148,7 @@ function Assert-BareWorkspaceIsolation {
       throw "$DeploymentMode bare route changed the workspace canary file"
     }
 
-    Assert-LatestWorkspaceToolInvocation -DeploymentMode $DeploymentMode -ExpectedPath '/workspace/bare-route-canary.txt' -BareRoute -ExpectedToolNames @('view_file') -ExpectedPathFields @('AbsolutePath') -Context "$DeploymentMode bare workspace denial probe"
+    Assert-LatestWorkspaceToolInvocation -DeploymentMode $DeploymentMode -UsageEvidence $response.TerminalEvidence -ExpectedPath '/workspace/bare-route-canary.txt' -BareRoute -ExpectedToolNames @('view_file') -ExpectedPathFields @('AbsolutePath') -Context "$DeploymentMode bare workspace denial probe"
 
     $control = Invoke-CompletionResponse -WireModel $script:SelectedModel -Token $script:BridgeToken -Prompt 'Reply exactly BARE_CONTROL_OK. Do not use tools.' -DeploymentMode $DeploymentMode
     [void](Get-CompletionText -Response $control)
@@ -1246,8 +1223,8 @@ function Assert-WorkspaceRwReadDenied {
   if ($res.Content.Contains($Canary)) {
     throw "RW workspace containment leaked canary from $Path"
   }
-  Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context "RW read denial probe for $Path"
-  Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -ExpectedPath $Path -ExpectedToolNames @('view_file') -ExpectedPathFields @('AbsolutePath') -Context "RW read denial probe for $Path"
+  Assert-LatestWorkspaceToolStep -DeploymentMode rw -UsageEvidence $res.TerminalEvidence -Context "RW read denial probe for $Path"
+  Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -UsageEvidence $res.TerminalEvidence -ExpectedPath $Path -ExpectedToolNames @('view_file') -ExpectedPathFields @('AbsolutePath') -Context "RW read denial probe for $Path"
   return $evidence
 }
 
@@ -1264,8 +1241,8 @@ function Assert-WorkspaceRwWriteDenied {
   if ($actual -ne $ExpectedCanary) {
     throw "RW workspace containment mutated non-workspace canary at $Path"
   }
-  Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context "RW write denial probe for $Path"
-  Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -ExpectedPath $Path -ExpectedToolNames @('write_to_file', 'replace_file_content') -ExpectedPathFields @('TargetFile') -Context "RW write denial probe for $Path"
+  Assert-LatestWorkspaceToolStep -DeploymentMode rw -UsageEvidence $res.TerminalEvidence -Context "RW write denial probe for $Path"
+  Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -UsageEvidence $res.TerminalEvidence -ExpectedPath $Path -ExpectedToolNames @('write_to_file', 'replace_file_content') -ExpectedPathFields @('TargetFile') -Context "RW write denial probe for $Path"
   return $evidence
 }
 
@@ -1788,8 +1765,8 @@ Do not delete files and do not use shell commands.
       if (-not $shadowText.Contains('DENIED')) {
         throw 'RW reserved-agent shadow denial probe returned HTTP 200 without explicit DENIED evidence'
       }
-      Assert-LatestWorkspaceToolStep -DeploymentMode rw -Context 'RW reserved-agent shadow denial probe'
-      Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -ExpectedPath $reservedContainerPath -ExpectedToolNames @('write_to_file', 'replace_file_content') -ExpectedPathFields @('TargetFile') -Context 'RW reserved-agent shadow denial probe'
+      Assert-LatestWorkspaceToolStep -DeploymentMode rw -UsageEvidence $res.TerminalEvidence -Context 'RW reserved-agent shadow denial probe'
+      Assert-LatestWorkspaceToolInvocation -DeploymentMode rw -UsageEvidence $res.TerminalEvidence -ExpectedPath $reservedContainerPath -ExpectedToolNames @('write_to_file', 'replace_file_content') -ExpectedPathFields @('TargetFile') -Context 'RW reserved-agent shadow denial probe'
       if (Test-Path -LiteralPath $reservedHostPath) {
         throw 'RW model created the reserved managed-agent path despite the exact policy deny'
       }

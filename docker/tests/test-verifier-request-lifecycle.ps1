@@ -69,6 +69,25 @@ Import-VerifierFunction -Name 'Stop-WorkspaceVerifierDeployment'
 Import-VerifierFunction -Name 'Remove-WorkspaceChildEnvObserverResult'
 Import-VerifierFunction -Name 'Remove-RwReservedShadowProbeArtifacts'
 
+# Tool evidence must stay attached to the exact correlated request. Reading the
+# latest usage row can silently bind a probe to another concurrent request.
+foreach ($functionName in @('Assert-LatestWorkspaceToolStep', 'Assert-LatestWorkspaceToolInvocation')) {
+  $functionNode = $ast.Find({
+    param($candidate)
+    $candidate -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+      $candidate.Name -eq $functionName
+  }, $true)
+  if ($null -eq $functionNode) {
+    Fail "verifier is missing $functionName"
+  }
+  if ($functionNode.Extent.Text -match "tail'\s*,\s*'-n'\s*,\s*'1'") {
+    Fail "$functionName still binds tool evidence to the latest uncorrelated usage row"
+  }
+  if ($functionNode.Extent.Text -notmatch '(?i)\$UsageEvidence\b') {
+    Fail "$functionName does not consume exact correlated usage evidence"
+  }
+}
+
 $script:CleanupBlocked = $false
 $script:CleanupBlockReason = $null
 $script:ApiBase = 'http://127.0.0.1:1'

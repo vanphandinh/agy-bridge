@@ -466,6 +466,73 @@ exit 7
   }
 });
 
+Deno.test("correlated pre-spawn rejection records terminal no-child evidence", async () => {
+  const harness = await ServiceHarness.create();
+  const requestId = "verify-pre-spawn-reject-001";
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${harness.port}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Agy-Request-Id": requestId,
+        },
+        body: JSON.stringify({
+          model: "definitely-not-a-real-model",
+          messages: [{ role: "user", content: "reject before child spawn" }],
+        }),
+      },
+    );
+    assertEquals(response.status, 400);
+
+    const usagePath = `${harness.stateDir}/usage.jsonl`;
+    const deadline = Date.now() + 500;
+    let matching: Record<string, unknown> | undefined;
+    while (Date.now() < deadline && !matching) {
+      try {
+        const rows = (await Deno.readTextFile(usagePath))
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as Record<string, unknown>);
+        matching = rows.find((row) => row.request_id === requestId);
+      } catch { /* evidence not written yet */ }
+      if (!matching) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    assertEquals(matching?.request_id, requestId);
+    assertEquals(matching?.child_started, false);
+    assertEquals(matching?.child_terminal, false);
+    assertEquals(matching?.failure_kind, "rejected");
+  } finally {
+    await harness.close();
+  }
+});
+
+Deno.test("invalid request correlation id is rejected before child spawn", async () => {
+  const harness = await ServiceHarness.create();
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${harness.port}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Agy-Request-Id": " invalid correlation id ",
+        },
+        body: JSON.stringify({
+          model: "gemini-2.5-pro",
+          messages: [{ role: "user", content: "must not spawn" }],
+        }),
+      },
+    );
+    assertEquals(response.status, 400);
+  } finally {
+    await harness.close();
+  }
+});
+
 Deno.test("client abort keeps concurrency held until a SIGTERM-resistant child is terminal", async () => {
   const mockScript = `#!/usr/bin/env bash
 set -euo pipefail

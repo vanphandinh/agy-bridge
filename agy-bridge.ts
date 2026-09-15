@@ -219,15 +219,33 @@ async function appendUsage(entry: Record<string, unknown>) {
   }
 }
 
+const REQUEST_CORRELATION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
 function requestCorrelationLog(req: Request): Record<string, string> {
   const requestId = req.headers.get("x-agy-request-id");
-  if (
-    requestId &&
-    /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestId)
-  ) {
+  if (requestId && REQUEST_CORRELATION_PATTERN.test(requestId)) {
     return { request_id: requestId };
   }
   return {};
+}
+
+async function rejectBeforeChild(
+  req: Request,
+  status: number,
+  message: string,
+): Promise<Response> {
+  const correlation = requestCorrelationLog(req);
+  if (correlation.request_id) {
+    await appendUsage({
+      ok: false,
+      error: message,
+      failure_kind: "rejected",
+      child_started: false,
+      child_terminal: false,
+      ...correlation,
+    });
+  }
+  return jsonError(status, message);
 }
 
 // ---------- concurrency gate ----------
@@ -1287,18 +1305,24 @@ function accessGuard(req: Request): Response | null {
 }
 
 async function handleChat(req: Request): Promise<Response> {
+  const requestId = req.headers.get("x-agy-request-id");
+  if (requestId && !REQUEST_CORRELATION_PATTERN.test(requestId)) {
+    return jsonError(400, "invalid request correlation id");
+  }
+
   let body: OAIChatRequest;
   try {
     body = await req.json();
   } catch {
-    return jsonError(400, "invalid JSON body");
+    return rejectBeforeChild(req, 400, "invalid JSON body");
   }
   const model = String(body.model ?? "");
-  if (!model) return jsonError(400, "missing model");
+  if (!model) return rejectBeforeChild(req, 400, "missing model");
   const auto = parseAutoModel(model);
   if (auto) {
     if (WORKSPACE?.mode === "ro" && auto.profile === "rw") {
-      return jsonError(
+      return rejectBeforeChild(
+        req,
         403,
         "workspace is read-only; read-write host workspace support is not enabled",
       );
@@ -1308,14 +1332,15 @@ async function handleChat(req: Request): Promise<Response> {
     // reasoning.effort, variant) funnel through variantSignals; the slug
     // suffix is parsed inside resolveWireModel from the wire model itself.
     const resolved = resolveWireModel(model, variantSignals(body), declared);
-    if (!resolved.ok) return jsonError(400, resolved.message);
+    if (!resolved.ok) return rejectBeforeChild(req, 400, resolved.message);
     return handleAutonomousChat(req, body, model, {
       ...auto,
       real: resolved.slug,
     });
   }
   if (!modelSlugs.includes(model)) {
-    return jsonError(
+    return rejectBeforeChild(
+      req,
       400,
       `unknown model "${model}"; available: ${modelSlugs.join(", ")}`,
     );
@@ -1508,7 +1533,25 @@ Deno.serve({ port: PORT, hostname: HOSTNAME }, async (req) => {
     return Response.json({ ok: true });
   }
   const denied = accessGuard(req);
-  if (denied) return denied;
+  if (denied) {
+    if (
+      req.method === "POST" &&
+      (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")
+    ) {
+      const correlation = requestCorrelationLog(req);
+      if (correlation.request_id) {
+        await appendUsage({
+          ok: false,
+          error: `request rejected before child spawn (HTTP ${denied.status})`,
+          failure_kind: "rejected",
+          child_started: false,
+          child_terminal: false,
+          ...correlation,
+        });
+      }
+    }
+    return denied;
+  }
   if (req.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
     await refreshModels();
     return Response.json({
