@@ -94,8 +94,17 @@ function Invoke-WorkspaceModeDockerCapture {
 $script:FixtureTranscript = @'
 {"type":"PLANNER_RESPONSE","tool_calls":[{"name":"view_file","args":{"AbsolutePath":"/workspace/README-fixture.txt"}}]}
 '@
+$script:FixtureEvidence = [pscustomobject]@{
+  Found = $true
+  RequestId = 'verify-synthetic-exact-target'
+  ToolStepUpdates = 1
+  Autonomous = 'rw'
+  Agent = 'agy-bridge-worker-rw-v1'
+  ConversationId = '11111111-1111-1111-1111-111111111111'
+}
 Assert-LatestWorkspaceToolStep `
   -DeploymentMode rw `
+  -UsageEvidence $script:FixtureEvidence `
   -Context 'synthetic unrelated control read'
 
 $exactFunction = Get-FunctionText -Name 'Assert-LatestWorkspaceToolInvocation'
@@ -109,6 +118,7 @@ $rejectedMissingTarget = $false
 try {
   Assert-LatestWorkspaceToolInvocation `
     -DeploymentMode rw `
+    -UsageEvidence $script:FixtureEvidence `
     -ExpectedPath $target `
     -ExpectedToolNames @('view_file') `
     -ExpectedPathFields @('AbsolutePath') `
@@ -131,6 +141,7 @@ $script:FixtureTranscript = @"
 "@
 Assert-LatestWorkspaceToolInvocation `
   -DeploymentMode rw `
+  -UsageEvidence $script:FixtureEvidence `
   -ExpectedPath $target `
   -ExpectedToolNames @('view_file') `
   -ExpectedPathFields @('AbsolutePath') `
@@ -143,6 +154,7 @@ $rejectedWrongTool = $false
 try {
   Assert-LatestWorkspaceToolInvocation `
     -DeploymentMode rw `
+    -UsageEvidence $script:FixtureEvidence `
     -ExpectedPath $target `
     -ExpectedToolNames @('view_file') `
     -ExpectedPathFields @('AbsolutePath') `
@@ -166,6 +178,7 @@ $script:FixtureTranscript = @"
 "@
 Assert-LatestWorkspaceToolInvocation `
   -DeploymentMode rw `
+  -UsageEvidence $script:FixtureEvidence `
   -ExpectedPath $writeTarget `
   -ExpectedToolNames @('write_to_file', 'replace_file_content') `
   -ExpectedPathFields @('TargetFile') `
@@ -178,6 +191,7 @@ $rejectedWrongWriteField = $false
 try {
   Assert-LatestWorkspaceToolInvocation `
     -DeploymentMode rw `
+    -UsageEvidence $script:FixtureEvidence `
     -ExpectedPath $writeTarget `
     -ExpectedToolNames @('write_to_file', 'replace_file_content') `
     -ExpectedPathFields @('TargetFile') `
