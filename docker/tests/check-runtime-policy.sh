@@ -20,7 +20,7 @@ grep -F 'sha512sum -c -' "$dockerfile" >/dev/null || {
   exit 1
 }
 grep -F 'ENV AGY_CLI_DISABLE_AUTO_UPDATE=true' "$dockerfile" >/dev/null || {
-  echo 'agy auto-update must be disabled so the pinned runtime binary cannot drift' >&2
+  echo 'agy auto-update must be disabled so the CLI self-updater cannot replace the pinned artifact' >&2
   exit 1
 }
 if grep -E 'curl[^|\r\n]*\|[^\r\n]*(ba)?sh' "$dockerfile" >/dev/null; then

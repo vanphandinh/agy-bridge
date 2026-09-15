@@ -33,6 +33,8 @@ USER agy
 ENV HOME=/home/agy
 ENV DENO_DIR=/home/agy/.cache/deno
 ENV PATH=/home/agy/.local/bin:${PATH}
+# Disable the CLI's own updater so it does not replace the checksum-pinned
+# artifact. This does not make the binary path filesystem-immutable.
 ENV AGY_CLI_DISABLE_AUTO_UPDATE=true
 
 ARG AGY_VERSION=1.2.2
